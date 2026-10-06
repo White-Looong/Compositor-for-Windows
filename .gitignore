@@ -1,0 +1,63 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# 构建产物
+build/
+dist/
+*.egg-info/
+.eggs/
+develop-eggs/
+wheels/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# 类型检查 / 格式化缓存
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.history/
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ---- 项目自身 ----
+# 工程文件与导出的图片（体积大，每个人的内容都不一样）
+*.cwproj
+*.psd
+export/
+exports/
+
+# 开发交接文档：含本机绝对路径与内部工作记录，不公开
+docs/HANDOFF.md
+
+# 临时测试产物
+*.log
+*.tmp
+*.bak
+/tmp/

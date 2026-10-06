@@ -1,0 +1,439 @@
+# -*- coding: utf-8 -*-
+"""属性面板：变换数值、文字参数、画布尺寸、图层信息。"""
+
+from __future__ import annotations
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
+                               QFontComboBox, QFormLayout, QGroupBox,
+                               QHBoxLayout, QLabel, QPlainTextEdit,
+                               QPushButton, QSpinBox, QVBoxLayout, QWidget)
+
+from ..core.text import ALIGN_CENTER, ALIGN_ITEMS
+from .adjust_panel import AdjustPanel
+from .tool_options import ColorSwatch
+
+
+class Inspector(QWidget):
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self._syncing = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        # ---- 变换 ----
+        self.g1 = g1 = QGroupBox("变换")
+        f1 = QFormLayout(g1)
+        f1.setLabelAlignment(Qt.AlignRight)
+        self.x = self._dbl(-100000, 100000, 1)
+        self.y = self._dbl(-100000, 100000, 1)
+        self.w = self._dbl(0.01, 100000, 1)
+        self.h = self._dbl(0.01, 100000, 1)
+        self.rot = self._dbl(-360, 360, 1)
+        for widget, label in ((self.x, "X"), (self.y, "Y"),
+                              (self.w, "宽"), (self.h, "高"),
+                              (self.rot, "角度")):
+            f1.addRow(label, widget)
+        for widget in (self.x, self.y, self.w, self.h, self.rot):
+            widget.valueChanged.connect(self._on_transform)
+            widget.editingFinished.connect(self._on_transform_done)
+
+        btns = QHBoxLayout()
+        self.btn_fh = QPushButton("水平翻转")
+        self.btn_fv = QPushButton("垂直翻转")
+        self.btn_reset = QPushButton("复位")
+        self.btn_fh.clicked.connect(self._flip_h)
+        self.btn_fv.clicked.connect(self._flip_v)
+        self.btn_reset.clicked.connect(self._reset)
+        for b in (self.btn_fh, self.btn_fv, self.btn_reset):
+            btns.addWidget(b)
+        f1.addRow(btns)
+        root.addWidget(g1)
+
+        # ---- 智能对象（只有选中智能对象图层时才显示）----
+        self.g_smart = QGroupBox("智能对象")
+        fs = QFormLayout(self.g_smart)
+        fs.setLabelAlignment(Qt.AlignRight)
+        self.smart_info = QLabel("-")
+        self.smart_info.setWordWrap(True)
+        self.btn_smart_edit = QPushButton("编辑内容…")
+        self.btn_smart_edit.setToolTip(
+            "在独立窗口里改这段内容 —— 所有共用它的实例会一起更新")
+        self.btn_smart_filters = QPushButton("智能滤镜…")
+        self.btn_smart_filters.setToolTip(
+            "参数化的滤镜：随时改参数、调顺序、删掉，原始内容不受影响")
+        self.btn_smart_raster = QPushButton("栅格化")
+        self.btn_smart_raster.setToolTip(
+            "烧成普通位图图层 —— 内容与智能滤镜从此不可再改")
+        self.btn_smart_edit.clicked.connect(self.main.edit_smart_content)
+        self.btn_smart_filters.clicked.connect(self.main.edit_smart_filters)
+        self.btn_smart_raster.clicked.connect(self.main.rasterize_smart)
+        fs.addRow(self.smart_info)
+        fs.addRow(self.btn_smart_edit)
+        fs.addRow(self.btn_smart_filters)
+        fs.addRow(self.btn_smart_raster)
+        root.addWidget(self.g_smart)
+
+        # ---- 图层样式 ----
+        self.g_style = QGroupBox("图层样式")
+        fst = QFormLayout(self.g_style)
+        fst.setLabelAlignment(Qt.AlignRight)
+        self.lab_style = QLabel("无")
+        self.lab_style.setWordWrap(True)
+        self.btn_style = QPushButton("图层样式…")
+        self.btn_style.setToolTip(
+            "描边 / 投影 / 内阴影 / 外发光 —— 参数存在图层上，随时可改")
+        self.btn_style.clicked.connect(self._open_styles)
+        fst.addRow(self.lab_style)
+        fst.addRow(self.btn_style)
+        root.addWidget(self.g_style)
+
+        # ---- 调整层参数（只有选中调整层时才显示）----
+        self.adjust = AdjustPanel(main)
+        root.addWidget(self.adjust)
+
+        # ---- 文字（只有选中文字图层时才显示）----
+        self.g_text = QGroupBox("文字")
+        ft = QFormLayout(self.g_text)
+        ft.setLabelAlignment(Qt.AlignRight)
+
+        self.txt_content = QPlainTextEdit()
+        self.txt_content.setFixedHeight(70)
+        self.txt_content.textChanged.connect(self._on_text_content)
+        ft.addRow("内容", self.txt_content)
+
+        self.txt_font = QFontComboBox()
+        self.txt_font.setMaximumWidth(150)
+        self.txt_font.currentFontChanged.connect(self._on_text_font)
+        ft.addRow("字体", self.txt_font)
+
+        self.txt_size = QSpinBox()
+        self.txt_size.setRange(1, 2000)
+        self.txt_size.setSingleStep(1)
+        self.txt_size.setMaximumWidth(118)
+        self.txt_size.valueChanged.connect(
+            lambda v: self._set_text("size", float(v)))
+        ft.addRow("字号", self.txt_size)
+
+        self.txt_color = ColorSwatch((0, 0, 0), "文字颜色")
+        self.txt_color.clickedColor.connect(self._pick_text_color)
+        ft.addRow("颜色", self.txt_color)
+
+        self.txt_lh = self._dbl(0.5, 5.0, 0.05)
+        self.txt_ls = self._dbl(-50.0, 200.0, 0.5)
+        self.txt_lh.valueChanged.connect(
+            lambda v: self._set_text("line_height", float(v)))
+        self.txt_ls.valueChanged.connect(
+            lambda v: self._set_text("letter_spacing", float(v)))
+        ft.addRow("行距", self.txt_lh)
+        ft.addRow("字距", self.txt_ls)
+
+        self.txt_align = QComboBox()
+        self.txt_align.addItems([lb for _k, lb in ALIGN_ITEMS])
+        self.txt_align.setMaximumWidth(118)
+        self.txt_align.currentIndexChanged.connect(self._on_text_align)
+        ft.addRow("对齐", self.txt_align)
+
+        style_row = QHBoxLayout()
+        self.cb_bold = QCheckBox("粗体")
+        self.cb_italic = QCheckBox("斜体")
+        self.cb_under = QCheckBox("下划线")
+        for cb, key in ((self.cb_bold, "bold"),
+                        (self.cb_italic, "italic"),
+                        (self.cb_under, "underline")):
+            cb.toggled.connect(lambda v, k=key: self._set_text(k, bool(v)))
+            style_row.addWidget(cb)
+        ft.addRow(style_row)
+
+        self.btn_raster = QPushButton("栅格化")
+        self.btn_raster.setToolTip(
+            "转成普通位图图层 —— 之后才能用画笔 / 滤镜改像素，但文字不能再改")
+        self.btn_raster.clicked.connect(self.main.rasterize_text)
+        ft.addRow(self.btn_raster)
+        root.addWidget(self.g_text)
+
+        # ---- 画布 ----
+        g2 = QGroupBox("画布")
+        f2 = QFormLayout(g2)
+        f2.setLabelAlignment(Qt.AlignRight)
+        self.cw = QSpinBox()
+        self.ch = QSpinBox()
+        for s in (self.cw, self.ch):
+            s.setRange(1, 30000)
+            s.setSingleStep(1)
+            s.setMaximumWidth(118)
+        self.cw.editingFinished.connect(self._on_canvas)
+        self.ch.editingFinished.connect(self._on_canvas)
+        f2.addRow("宽", self.cw)
+        f2.addRow("高", self.ch)
+        btn_fit = QPushButton("按内容裁剪")
+        btn_fit.clicked.connect(self._trim_to_content)
+        f2.addRow(btn_fit)
+        root.addWidget(g2)
+
+        # ---- 信息 ----
+        g3 = QGroupBox("图层信息")
+        f3 = QFormLayout(g3)
+        f3.setLabelAlignment(Qt.AlignRight)
+        self.info = QLabel("-")
+        self.info.setWordWrap(True)
+        f3.addRow(self.info)
+        root.addWidget(g3)
+
+        root.addStretch(1)
+
+    def _dbl(self, lo, hi, step):
+        s = QDoubleSpinBox()
+        s.setRange(lo, hi)
+        s.setDecimals(2)
+        s.setSingleStep(step)
+        s.setKeyboardTracking(True)
+        s.setMaximumWidth(118)
+        return s
+
+    # ---------- 同步 ----------
+
+    def refresh(self):
+        self._syncing = True
+        layer = self.main.selected_layer()
+        is_adj = bool(layer is not None and layer.is_adjustment)
+        # 调整层没有像素，变换面板对它没意义
+        self.g1.setVisible(not is_adj)
+        enable = layer is not None and not layer.is_group and not is_adj
+        for widget in (self.x, self.y, self.w, self.h, self.rot,
+                       self.btn_fh, self.btn_fv, self.btn_reset):
+            widget.setEnabled(enable)
+        self.adjust.refresh()
+        is_text = bool(layer is not None and layer.is_text)
+        self.g_text.setVisible(is_text)
+        if is_text:
+            self._fill_text(layer)
+        self._fill_smart(layer)
+        self._fill_style(layer)
+        if is_adj:
+            self.info.setText(
+                "名称: %s\n类型: 调整层\n调整: %s\n蒙版: %s"
+                % (layer.name, layer.adjustment_key(),
+                   "有" if layer.mask is not None else "无"))
+            doc = self.main.doc
+            if doc:
+                self.cw.setValue(doc.width)
+                self.ch.setValue(doc.height)
+            self._syncing = False
+            return
+        if layer is not None and not layer.is_group:
+            src = layer.src_size or (0, 0)
+            self.x.setValue(layer.tx)
+            self.y.setValue(layer.ty)
+            self.w.setValue(abs(src[0] * layer.sx))
+            self.h.setValue(abs(src[1] * layer.sy))
+            self.rot.setValue(layer.rot)
+            p = layer.text or {}
+            extra = ""
+            if layer.is_text:
+                extra = "\n字体: %s  %.0f px" % (
+                    p.get("family") or "默认", float(p.get("size", 0.0)))
+            self.info.setText(
+                "名称: %s\n类型: %s\n源尺寸: %d x %d\n缩放: %.1f%% x %.1f%%\n"
+                "蒙版: %s%s" % (layer.name,
+                                "文字" if layer.is_text
+                                else ("智能对象" if layer.is_smart else "位图"),
+                                src[0], src[1],
+                                layer.sx * 100, layer.sy * 100,
+                                "有" if layer.mask is not None else "无",
+                                extra))
+        elif layer is not None:
+            self.info.setText("名称: %s\n类型: 图层组\n子图层: %d"
+                              % (layer.name, len(layer.children)))
+        else:
+            for widget in (self.x, self.y, self.w, self.h, self.rot):
+                widget.setValue(0)
+            self.info.setText("未选中图层")
+
+        doc = self.main.doc
+        if doc:
+            self.cw.setValue(doc.width)
+            self.ch.setValue(doc.height)
+        self._syncing = False
+
+    def _fill_smart(self, layer):
+        is_smart = bool(layer is not None and layer.is_smart)
+        self.g_smart.setVisible(is_smart)
+        if not is_smart:
+            return
+        doc = self.main.doc
+        content = (doc.smart_contents or {}).get(layer.so_id) if doc else None
+        if content is None:
+            self.smart_info.setText("内容已丢失")
+            return
+        try:
+            from ..core.smart import content_instances
+            n = len(content_instances(doc, layer.so_id))
+        except Exception:
+            n = 1
+        nf = len(layer.so_filters or [])
+        self.smart_info.setText(
+            "内容: %d x %d\n实例: %d 个（共用同一份内容）\n智能滤镜: %d 条"
+            % (content.width, content.height, n, nf))
+
+    # ---------- 图层样式 ----------
+
+    def _fill_style(self, layer):
+        from ..core.effects import EFFECT_NAMES, EFFECT_ORDER
+        on = bool(layer is not None and not layer.is_group
+                  and not layer.is_adjustment)
+        self.g_style.setVisible(on)
+        if not on:
+            return
+        names = []
+        eff = layer.effects or {}
+        for key in EFFECT_ORDER:
+            d = eff.get(key)
+            if isinstance(d, dict) and d.get("enabled"):
+                names.append(EFFECT_NAMES[key])
+        self.lab_style.setText("、".join(names) if names else "无")
+
+    def _open_styles(self):
+        from .style_dialog import StyleDialog
+        layer = self.main.selected_layer()
+        if layer is None or layer.is_group or layer.is_adjustment:
+            return
+        dlg = StyleDialog(layer, self.main, self)
+        dlg.exec()
+        self._fill_style(layer)
+        self.refresh()
+
+    # ---------- 文字 ----------
+
+    def _fill_text(self, layer):
+        p = layer.text or {}
+        self.txt_content.setPlainText(str(p.get("content", "")))
+        fam = p.get("family") or ""
+        if fam:
+            idx = self.txt_font.findText(fam)
+            if idx >= 0:
+                self.txt_font.setCurrentIndex(idx)
+        self.txt_size.setValue(int(round(float(p.get("size", 96.0)))))
+        c = p.get("color") or (0, 0, 0)
+        self.txt_color.set_color(
+            (int(c[0]), int(c[1]), int(c[2])) if len(c) >= 3 else (0, 0, 0))
+        self.txt_lh.setValue(float(p.get("line_height", 1.2)))
+        self.txt_ls.setValue(float(p.get("letter_spacing", 0.0)))
+        keys = [k for k, _lb in ALIGN_ITEMS]
+        a = p.get("align", ALIGN_CENTER)
+        self.txt_align.setCurrentIndex(
+            keys.index(a) if a in keys else keys.index(ALIGN_CENTER))
+        self.cb_bold.setChecked(bool(p.get("bold", False)))
+        self.cb_italic.setChecked(bool(p.get("italic", False)))
+        self.cb_under.setChecked(bool(p.get("underline", False)))
+
+    def _set_text(self, key, value):
+        if self._syncing:
+            return
+        self.main.set_text_param(key, value)
+
+    def _on_text_content(self):
+        if self._syncing:
+            return
+        self.main.set_text_param("content", self.txt_content.toPlainText())
+
+    def _on_text_font(self, font):
+        if self._syncing:
+            return
+        self.main.set_text_param("family", font.family())
+
+    def _on_text_align(self, index):
+        if self._syncing:
+            return
+        if 0 <= index < len(ALIGN_ITEMS):
+            self.main.set_text_param("align", ALIGN_ITEMS[index][0])
+
+    def _pick_text_color(self):
+        from PySide6.QtWidgets import QColorDialog
+        c = QColorDialog.getColor(self.txt_color.color(), self, "文字颜色")
+        if c.isValid():
+            self.txt_color.set_color((c.red(), c.green(), c.blue()))
+            self.main.set_text_param(
+                "color", [c.red(), c.green(), c.blue()])
+
+    # ---------- 编辑 ----------
+
+    def _on_transform(self, _v=None):
+        if self._syncing:
+            return
+        layer = self.main.selected_layer()
+        if layer is None or layer.is_group:
+            return
+        src = layer.src_size
+        if not src:
+            return
+        sw, sh = src
+        layer.tx = self.x.value()
+        layer.ty = self.y.value()
+        sx = self.w.value() / sw if sw else 1.0
+        sy = self.h.value() / sh if sh else 1.0
+        layer.sx = sx if abs(sx) > 1e-4 else 0.01
+        layer.sy = sy if abs(sy) > 1e-4 else 0.01
+        layer.rot = self.rot.value()
+        self.main.request_render()
+        self.main.view._update_handles()
+
+    def _on_transform_done(self):
+        if self._syncing:
+            return
+        self.main.commit("变换数值")
+
+    def _flip_h(self):
+        layer = self.main.selected_layer()
+        if layer is None or layer.is_group:
+            return
+        layer.flip_h = not layer.flip_h
+        self.main.commit("水平翻转")
+        self.main.request_render()
+
+    def _flip_v(self):
+        layer = self.main.selected_layer()
+        if layer is None or layer.is_group:
+            return
+        layer.flip_v = not layer.flip_v
+        self.main.commit("垂直翻转")
+        self.main.request_render()
+
+    def _reset(self):
+        layer = self.main.selected_layer()
+        doc = self.main.doc
+        if layer is None or layer.is_group or not doc:
+            return
+        layer.sx = 1.0
+        layer.sy = 1.0
+        layer.rot = 0.0
+        layer.flip_h = False
+        layer.flip_v = False
+        layer.tx = doc.width / 2.0
+        layer.ty = doc.height / 2.0
+        self.main.commit("复位变换")
+        self.main.request_render()
+        self.refresh()
+
+    def _on_canvas(self):
+        if self._syncing:
+            return
+        doc = self.main.doc
+        if not doc:
+            return
+        w, h = self.cw.value(), self.ch.value()
+        if (w, h) != (doc.width, doc.height):
+            doc.resize(w, h)
+            self.main.commit("画布大小")
+            self.main.request_render()
+            self.main.view.update_selection_overlay()
+
+    def _trim_to_content(self):
+        self.main.trim_to_content()
+
+    def on_rendered(self):
+        """渲染完成后只刷新直方图，不重建控件。"""
+        self.adjust.refresh_hist()
