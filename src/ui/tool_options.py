@@ -24,6 +24,13 @@ SEL_MODES = [
 SELECT_TOOLS = {"rect", "ellipse", "lasso", "polygon", "magic"}
 PAINT_TOOLS = {"brush", "eraser"}
 TEXT_TOOLS = {"text"}
+# 修饰类工具：参数各不相同，各自有独立的参数组
+GRADIENT_TOOLS = {"gradient"}
+BLUR_TOOLS = {"blurtool"}
+PICK_TOOLS = {"picker"}
+# 第二十批：克隆图章（Alt 采样）、污点修复、形状工具
+CLONE_TOOLS = {"clone", "heal"}
+SHAPE_TOOLS = {"shape"}
 
 
 def _slider(maximum, value, width=92):
@@ -86,11 +93,32 @@ class ToolOptions(QToolBar):
         self.font_size = 96
         self.font_bold = False
 
+        # 渐变工具：样式 + 两个色标（前景色 → 背景色，由 fg/bg 同步过来）
+        self.grad_style = "线性"
+        self.grad_reverse = False
+
+        # 模糊工具：复用画笔的「大小 / 硬度」，另加每次落笔的量
+        self.blur_strength = 0.5
+        # 吸管：取样半径（0 = 单点），是否从合成结果取
+        self.pick_radius = 0
+        self.pick_composite = True
+
+        # 克隆图章：Alt 采样的偏移（源坐标 - 当前落点），按住 Alt 重新采样
+        self.clone_offset = None
+        # 形状工具：矩形 / 椭圆 / 直线，填充用前景色
+        self.shape_kind = "矩形"
+        self.shape_outline = False
+
         self._build_hint()
         self._build_select()
         self.act_sep1 = self._add_sep()
         self._build_brush()
         self._build_text()
+        self._build_gradient()
+        self._build_blur()
+        self._build_pick()
+        self._build_clone()
+        self._build_shape()
         self.act_sep2 = self._add_sep()
         self._build_colors()
 
@@ -253,6 +281,176 @@ class ToolOptions(QToolBar):
         lay.addWidget(self.text_swatch)
         self.act_text = self.addWidget(self.grp_text)
 
+    def _build_gradient(self):
+        """渐变工具：样式 + 反向。颜色用通用的前景/背景色（fg → bg）。"""
+        from ..core.retouch import GRADIENT_STYLES
+        self.grp_gradient = QWidget()
+        lay = QHBoxLayout(self.grp_gradient)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        self.combo_grad = QComboBox()
+        self.combo_grad.addItems(list(GRADIENT_STYLES))
+        self.combo_grad.setMaximumWidth(80)
+        self.combo_grad.setToolTip("渐变样式：线性 / 径向 / 角度 / 对称 / 菱形")
+        self.combo_grad.currentTextChanged.connect(
+            lambda s: setattr(self, "grad_style", s))
+        lay.addWidget(QLabel("样式"))
+        lay.addWidget(self.combo_grad)
+
+        cb = QCheckBox("反向")
+        cb.setToolTip("交换两个色标：背景色 → 前景色")
+        cb.toggled.connect(lambda v: setattr(self, "grad_reverse", bool(v)))
+        self.chk_grad_rev = cb
+        lay.addWidget(cb)
+
+        self.lab_grad_hint = QLabel("拖出一条线确定渐变方向与范围")
+        self.lab_grad_hint.setStyleSheet("color:#9a9a9e;")
+        lay.addWidget(self.lab_grad_hint)
+        self.act_gradient = self.addWidget(self.grp_gradient)
+
+    def _build_blur(self):
+        """模糊工具：大小 / 硬度复用画笔那套，另加「强度」。"""
+        self.grp_blur = QWidget()
+        lay = QHBoxLayout(self.grp_blur)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        self.spin_blur_size = QSpinBox()
+        self.spin_blur_size.setRange(1, 2000)
+        self.spin_blur_size.setValue(self.size)
+        self.spin_blur_size.setMaximumWidth(70)
+        self.spin_blur_size.valueChanged.connect(
+            lambda v: setattr(self, "size", int(v)))
+        lay.addWidget(QLabel("大小"))
+        lay.addWidget(self.spin_blur_size)
+
+        lay.addWidget(QLabel("硬度"))
+        self.spin_blur_hard = _slider(100, int(round(self.hardness * 100)))
+        self._val_blur_hard = QLabel("%d%%" % int(round(self.hardness * 100)))
+        self._val_blur_hard.setFixedWidth(38)
+        self._val_blur_hard.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.spin_blur_hard.valueChanged.connect(self._on_blur_hard)
+        lay.addWidget(self.spin_blur_hard)
+        lay.addWidget(self._val_blur_hard)
+
+        lay.addWidget(QLabel("强度"))
+        self.spin_blur_str = _slider(100, int(round(self.blur_strength * 100)))
+        self._val_blur_str = QLabel("%d%%" % int(round(self.blur_strength * 100)))
+        self._val_blur_str.setFixedWidth(38)
+        self._val_blur_str.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.spin_blur_str.valueChanged.connect(self._on_blur_str)
+        lay.addWidget(self.spin_blur_str)
+        lay.addWidget(self._val_blur_str)
+        self.act_blur = self.addWidget(self.grp_blur)
+
+    def _on_blur_hard(self, v):
+        self.hardness = v / 100.0
+        self._val_blur_hard.setText("%d%%" % v)
+
+    def _on_blur_str(self, v):
+        self.blur_strength = v / 100.0
+        self._val_blur_str.setText("%d%%" % v)
+
+    def _build_pick(self):
+        """吸管：取样半径 + 取样来源。"""
+        self.grp_pick = QWidget()
+        lay = QHBoxLayout(self.grp_pick)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        lay.addWidget(QLabel("取样"))
+        self.spin_pick_rad = QSpinBox()
+        self.spin_pick_rad.setRange(0, 64)
+        self.spin_pick_rad.setSuffix(" px")
+        self.spin_pick_rad.setMaximumWidth(72)
+        self.spin_pick_rad.setToolTip("0 = 只取点击的那一个像素；>0 取邻域均值，能避开杂点")
+        self.spin_pick_rad.valueChanged.connect(
+            lambda v: setattr(self, "pick_radius", int(v)))
+        lay.addWidget(self.spin_pick_rad)
+
+        cb = QCheckBox("所有图层")
+        cb.setChecked(True)
+        cb.setToolTip("勾 = 从合成结果取色；不勾 = 只从当前图层取")
+        cb.toggled.connect(lambda v: setattr(self, "pick_composite", bool(v)))
+        self.chk_pick_all = cb
+        lay.addWidget(cb)
+        self.act_pick = self.addWidget(self.grp_pick)
+
+    def _build_clone(self):
+        """克隆图章 / 污点修复：共用「大小 / 硬度 / 强度」。"""
+        self.grp_clone = QWidget()
+        lay = QHBoxLayout(self.grp_clone)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        self.spin_clone_size = QSpinBox()
+        self.spin_clone_size.setRange(1, 2000)
+        self.spin_clone_size.setValue(self.size)
+        self.spin_clone_size.setMaximumWidth(70)
+        self.spin_clone_size.valueChanged.connect(
+            lambda v: setattr(self, "size", int(v)))
+        lay.addWidget(QLabel("大小"))
+        lay.addWidget(self.spin_clone_size)
+
+        lay.addWidget(QLabel("硬度"))
+        self.spin_clone_hard = _slider(100, int(round(self.hardness * 100)))
+        v1 = QLabel("%d%%" % int(round(self.hardness * 100)))
+        v1.setFixedWidth(38)
+        v1.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.spin_clone_hard.valueChanged.connect(
+            lambda v: self._set_pair("hardness", v, v1))
+        lay.addWidget(self.spin_clone_hard)
+        lay.addWidget(v1)
+
+        lay.addWidget(QLabel("强度"))
+        self.spin_clone_str = _slider(100, int(round(self.blur_strength * 100)))
+        v2 = QLabel("%d%%" % int(round(self.blur_strength * 100)))
+        v2.setFixedWidth(38)
+        v2.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.spin_clone_str.valueChanged.connect(
+            lambda v: self._set_pair("strength", v, v2))
+        lay.addWidget(self.spin_clone_str)
+        lay.addWidget(v2)
+
+        self.lab_clone_hint = QLabel("按住 Alt 采样，松开拖动盖章")
+        self.lab_clone_hint.setStyleSheet("color:#9a9a9e;")
+        lay.addWidget(self.lab_clone_hint)
+        self.act_clone = self.addWidget(self.grp_clone)
+
+    def _set_pair(self, attr, v, label):
+        if attr == "strength":
+            self.blur_strength = v / 100.0
+        else:
+            self.hardness = v / 100.0
+        label.setText("%d%%" % v)
+
+    def _build_shape(self):
+        """形状工具：矩形 / 椭圆 / 直线 + 实心 / 描边。"""
+        self.grp_shape = QWidget()
+        lay = QHBoxLayout(self.grp_shape)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        self.combo_shape = QComboBox()
+        self.combo_shape.addItems(["矩形", "椭圆", "直线"])
+        self.combo_shape.setMaximumWidth(80)
+        self.combo_shape.currentTextChanged.connect(
+            lambda s: setattr(self, "shape_kind", s))
+        lay.addWidget(QLabel("形状"))
+        lay.addWidget(self.combo_shape)
+
+        cb = QCheckBox("描边")
+        cb.setToolTip("不勾 = 实心填充；勾了 = 只画边框，内部不动")
+        cb.toggled.connect(lambda v: setattr(self, "shape_outline", bool(v)))
+        self.chk_shape_outline = cb
+        lay.addWidget(cb)
+
+        self.lab_shape_hint = QLabel("拖出形状，Shift 等比")
+        self.lab_shape_hint.setStyleSheet("color:#9a9a9e;")
+        lay.addWidget(self.lab_shape_hint)
+        self.act_shape = self.addWidget(self.grp_shape)
+
     def _build_colors(self):
         self.fg = ColorSwatch((0, 0, 0), "前景色")
         self.bg = ColorSwatch((255, 255, 255), "背景色")
@@ -289,6 +487,42 @@ class ToolOptions(QToolBar):
             "color": list(self.text_swatch.rgb()),
         }
 
+    # ---------- 修饰类工具 ----------
+
+    def gradient_params(self):
+        """渐变工具参数。两个色标直接取前景色 / 背景色（PS 的语义）。"""
+        a, b = self.fg.rgb(), self.bg.rgb()
+        if self.grad_reverse:
+            a, b = b, a
+        return {"style": self.grad_style,
+                "color": list(a), "color2": list(b)}
+
+    def sync_gradient_hint(self):
+        """切到渐变工具时刷新那句提示（颜色变了要重画色标）。"""
+        self.lab_grad_hint.setText(
+            "拖出一条线确定渐变方向与范围 · %s → %s"
+            % (self.gradient_params()["color"], self.gradient_params()["color2"]))
+
+    def blur_params(self):
+        return {"size": float(self.size),
+                "hardness": float(self.hardness),
+                "strength": float(self.blur_strength)}
+
+    def pick_params(self):
+        return {"radius": int(self.pick_radius),
+                "composite": bool(self.pick_composite)}
+
+    # ---------- 第二十批 ----------
+
+    def clone_params(self):
+        """克隆图章 / 污点修复的共用参数。"""
+        return {"size": float(self.size),
+                "hardness": float(self.hardness),
+                "strength": float(self.blur_strength)}
+
+    def shape_params(self):
+        return {"kind": self.shape_kind, "outline": bool(self.shape_outline)}
+
     # ---------- 笔刷 ----------
 
     def brush_params(self):
@@ -315,16 +549,30 @@ class ToolOptions(QToolBar):
         is_sel = tool in SELECT_TOOLS
         is_paint = tool in PAINT_TOOLS
         is_text = tool in TEXT_TOOLS
+        is_grad = tool in GRADIENT_TOOLS
+        is_blur = tool in BLUR_TOOLS
+        is_pick = tool in PICK_TOOLS
+        is_clone = tool in CLONE_TOOLS
+        is_shape = tool in SHAPE_TOOLS
         self.act_sel.setVisible(is_sel)
         self.act_brush.setVisible(is_paint)
         self.act_text.setVisible(is_text)
+        self.act_gradient.setVisible(is_grad)
+        self.act_blur.setVisible(is_blur)
+        self.act_pick.setVisible(is_pick)
+        self.act_clone.setVisible(is_clone)
+        self.act_shape.setVisible(is_shape)
         self.lab_tol.setVisible(tool == "magic")
         self.spin_tol.setVisible(tool == "magic")
         self.act_sep1.setVisible(is_sel)
         self.act_sep2.setVisible(is_paint or is_text)
-        need_color = is_paint or tool == "fill"
+        # 渐变/模糊要前景色背景色（模糊只要前景色作提示，渐变两个都要）
+        need_color = (is_paint or tool == "fill" or is_grad or is_blur
+                      or is_shape)
         for a in (self.act_fg, self.act_bg, self.act_swap):
             a.setVisible(need_color)
+        if is_grad:
+            self.sync_gradient_hint()
         self.act_hint.setVisible(tool == "move")
 
     def sync_target_availability(self, has_mask, only_mask=False):

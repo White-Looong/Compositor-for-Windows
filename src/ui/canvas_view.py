@@ -15,21 +15,26 @@ import math
 import time
 
 import numpy as np
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import (QEvent, QLineF, QPointF, QRect, QRectF, Qt, QTimer,
+                          Signal)
 from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter,
                            QPainterPath, QPen, QPixmap, QPolygonF,
                            QTextBlockFormat, QTextCursor, QTransform)
-from PySide6.QtWidgets import (QFrame, QGraphicsEllipseItem, QGraphicsPathItem,
-                               QGraphicsPixmapItem, QGraphicsPolygonItem,
-                               QGraphicsRectItem, QGraphicsScene,
-                               QGraphicsView, QPlainTextEdit)
+from PySide6.QtWidgets import (QFrame, QGraphicsEllipseItem,
+                               QGraphicsItem, QGraphicsLineItem,
+                               QGraphicsPathItem, QGraphicsPixmapItem,
+                               QGraphicsPolygonItem, QGraphicsRectItem,
+                               QGraphicsScene, QGraphicsView, QPlainTextEdit)
 
+from ..core import guides as _guides
 from ..core import quick_mask
 from ..core.effects import effect_padding
 from ..core.paint import Stroke, _gray
 from ..core.selection import (ADD, INTERSECT, REPLACE, SUBTRACT, Selection)
 from . import brush_dialog
-from .tool_options import PAINT_TOOLS, SELECT_TOOLS
+from .tool_options import (BLUR_TOOLS, CLONE_TOOLS, GRADIENT_TOOLS,
+                          PAINT_TOOLS, PICK_TOOLS, SELECT_TOOLS,
+                          SHAPE_TOOLS)
 
 # 手柄定义: 名称 -> (锚点在图像中心坐标中的符号, 固定点符号, 影响 x/y)
 HANDLE_DEFS = {
@@ -101,6 +106,25 @@ class CanvasView(QGraphicsView):
 
         # 绘制相关
         self._stroke = None
+        # 模糊工具按住拖动时的轨迹（用来补样，快速拖动不漏成珠子）
+        self._blur_drag = None
+        # 污点修复 / 克隆图章的轨迹，形状工具的起点
+        self._heal_drag = None
+        self._clone_drag = None
+        self._shape_start = None
+        # 克隆图章的采样源（按住 Alt 时由 main_window 填进来）
+        self.clone_source = None
+        # 渐变工具那条预览线（场景在 setScene 之后才挂，得在那儿再建）
+        self.grad_line = None
+        # 向导类（第二十一批）：标尺 / 参考线 / 网格 / 拖动吸附
+        self.show_rulers = True
+        self.show_grid = False
+        self.grid_spacing = 50.0
+        self.grid_subdiv = 1
+        self.snap_enabled = True
+        self._snap_lines = []          # 拖动时命中的那些线（画高亮）
+        self._drag_guides = None       # 从标尺拖参考线：{"kind":..., "cur":QPointF}
+        self._snap_kind = None         # 移动工具拖动时命中的吸附源
         # 画布内编辑文字（Ctrl+T）：叠在 viewport 上的输入框
         self._text_edit = None
         self._text_edit_layer = None
@@ -172,6 +196,35 @@ class CanvasView(QGraphicsView):
         self.brush_ring.setBrush(QBrush(Qt.NoBrush))
         self.scene.addItem(self.brush_ring)
 
+        # 参考线：一堆细长矩形（竖线 = 窄而高，横线 = 宽而窄）
+        # 用图元而不是 drawForeground 画，是为了让它们能接收鼠标事件
+        # （拖动已有参考线 / 从标尺拖出新的一条）
+        self._guide_items = []
+        self._guide_dragging = False
+
+        # 形状工具的预览框
+        self.shape_preview = QGraphicsRectItem()
+        self.shape_preview.setZValue(49)
+        self.shape_preview.setPen(QPen(QColor(255, 255, 255, 220), 1.4))
+        self.shape_preview.setBrush(QBrush(Qt.NoBrush))
+        self.shape_preview.setVisible(False)
+        self.scene.addItem(self.shape_preview)
+
+        # 克隆图章的源位置标记（跟着 Alt 采样点走）
+        self.clone_ring = QGraphicsRectItem()
+        self.clone_ring.setZValue(48)
+        self.clone_ring.setPen(QPen(QColor(255, 220, 120, 230), 1.4))
+        self.clone_ring.setBrush(QBrush(Qt.NoBrush))
+        self.clone_ring.setVisible(False)
+        self.scene.addItem(self.clone_ring)
+
+        # 渐变工具的预览线（场景就绪后才能 addItem）
+        self.grad_line = QGraphicsLineItem()
+        self.grad_line.setZValue(50)
+        self.grad_line.setPen(QPen(QColor(255, 255, 255, 220), 1.4))
+        self.grad_line.setVisible(False)
+        self.scene.addItem(self.grad_line)
+
         self._ant_timer = QTimer(self)
         self._ant_timer.setInterval(ANT_INTERVAL)
         self._ant_timer.timeout.connect(self._tick_ants)
@@ -214,6 +267,13 @@ class CanvasView(QGraphicsView):
 
     def _make_transform(self):
         return QTransform.fromScale(self.zoom, self.zoom)
+
+    def _ruler_inset(self):
+        """标尺占掉的视口边距（四周内缩）。"""
+        if not self.show_rulers:
+            return 0, 0, 0, 0
+        r = self.RULER
+        return (r, r, 0, 0)
 
     def fit(self):
         doc = self.main.doc
@@ -401,7 +461,8 @@ class CanvasView(QGraphicsView):
         self.rot_handle.setVisible(True)
 
     def _update_brush_ring(self, pos=None):
-        if self.tool in PAINT_TOOLS:
+        if self.tool in PAINT_TOOLS or self.tool in BLUR_TOOLS \
+                or self.tool in CLONE_TOOLS:
             r = self.main.opts.size / 2.0
             if pos is None:
                 self.brush_ring.setVisible(False)
@@ -411,6 +472,345 @@ class CanvasView(QGraphicsView):
             self.brush_ring.setVisible(True)
         else:
             self.brush_ring.setVisible(False)
+
+    # ---------- 修饰类工具的预览 ----------
+
+    def _show_gradient_line(self, start, end):
+        self.grad_line.setLine(QLineF(start, end))
+        self.grad_line.setPen(
+            QPen(QColor(255, 255, 255, 220), 1.4 / max(0.05, self.zoom)))
+        self.grad_line.setVisible(True)
+
+    def _hide_gradient_line(self):
+        self.grad_line.setVisible(False)
+
+    # ---------- 向导：标尺 / 参考线 / 网格（第二十一批）----------
+
+    RULER = 18              # 标尺厚度（视口像素，不随缩放变）
+
+    def ruler_rect(self):
+        """标尺占的两条带（左 + 上）。没开就返回 None。"""
+        if not self.show_rulers:
+            return None
+        w = self.viewport().width()
+        h = self.viewport().height()
+        r = self.RULER
+        return (0, 0, r, h), (r, 0, w, r)
+
+    def in_ruler(self, x, y):
+        """视口坐标是否落在标尺带里。"""
+        rr = self.ruler_rect()
+        if rr is None:
+            return None
+        (lx, ly, lw, lh), (tx, ty, tw, th) = rr
+        if lx <= x < lx + lw and ly <= y < ly + lh:
+            return _guides.H_GUIDE
+        if tx <= x < tx + tw and ty <= y < ty + th:
+            return _guides.V_GUIDE
+        return None
+
+    def guides(self):
+        return self.main.doc.guides if self.main.doc is not None else None
+
+    def rebuild_guide_items(self):
+        """按doc.guides 重建参考线图元。只在参考线集合变了之后调。"""
+        for it in self._guide_items:
+            self.scene.removeItem(it)
+        self._guide_items = []
+        gs = self.guides()
+        doc = self.main.doc
+        if gs is None or doc is None:
+            return
+        w, h = float(doc.width), float(doc.height)
+        for g in gs.guides:
+            it = QGraphicsLineItem()
+            it.setData(0, g.id)
+            if g.is_horizontal:
+                it.setLine(0.0, g.pos, w, g.pos)
+            else:
+                it.setLine(g.pos, 0.0, g.pos, h)
+            col = QColor(*g.color)
+            col.setAlpha(220)
+            it.setPen(QPen(col, 1.0))
+            it.setZValue(30)
+            it.setFlag(QGraphicsItem.ItemIsSelectable, False)
+            self.scene.addItem(it)
+            self._guide_items.append(it)
+        self.viewport().update()
+
+    def sync_grid(self):
+        """网格的显示开关跟着 doc 走（可能被工程文件带进来）。"""
+        gs = self.guides()
+        if gs is None:
+            return
+        self.show_grid = gs.grid.visible
+        self.grid_spacing = gs.grid.spacing
+        self.grid_subdiv = gs.grid.subdiv
+        self.snap_enabled = (gs.snap_guides or gs.snap_grid
+                             or gs.snap_layers or gs.snap_doc)
+        self.viewport().update()
+
+    def snap_tolerance(self):
+        """吸附容差（**视口**像素）—— 屏幕上 7 px 换算成世界坐标。"""
+        return 7.0 / max(self.zoom, 1e-6)
+
+    def apply_snap(self, x, y, exclude_layer=None):
+        """把画布坐标 (x,y) 吸到最近的吸附线上。
+
+        返回 (sx, sy, hit)。`hit` 与 `guides.snap_point` 的第三项同构。
+        吸附总开关关掉、或没开任何一种源时原样返回。
+        """
+        gs = self.guides()
+        doc = self.main.doc
+        if gs is None or doc is None:
+            return x, y, []
+        if not (gs.snap_guides or gs.snap_grid or gs.snap_layers or gs.snap_doc):
+            return x, y, []
+        layers = doc.layers if gs.snap_layers else ()
+        return _guides.snap_point(x, y, gs, doc.width, doc.height,
+                                 layers=layers, tol=self.snap_tolerance(),
+                                 exclude=exclude_layer)
+
+    # ---------- 标尺 / 网格 / 吸附高亮的绘制 ----------
+
+    def drawForeground(self, painter, rect):
+        # 参考线本身是图元（能被拖动），这里只画**标尺、网格、吸附高亮**
+        super().drawForeground(painter, rect)
+        if self.main.doc is None:
+            return
+        painter.save()
+        try:
+            if self.show_grid:
+                self._paint_grid(painter, rect)
+            self._paint_snap_lines(painter)
+        finally:
+            painter.restore()
+        rr = self.ruler_rect()
+        if rr is not None:
+            self._paint_rulers(painter, rr)
+
+    def _scene_rect(self, rect):
+        """把视口矩形换成场景坐标（考虑滚动与缩放）。"""
+        tl = self.mapToScene(0, 0)
+        br = self.mapToScene(self.viewport().width(),
+                             self.viewport().height())
+        return QRectF(tl, br)
+
+    def _paint_grid(self, painter, rect):
+        doc = self.main.doc
+        gs = self.guides()
+        if doc is None or gs is None:
+            return
+        spec = _guides.GridSpec(self.show_grid, self.grid_spacing,
+                               self.grid_subdiv)
+        xs, ys = spec.lines(doc.width, doc.height)
+        if not xs and not ys:
+            return
+        z = 1.0 / max(self.zoom, 1e-6)
+        col = QColor(120, 140, 170, 90)
+        col.setAlpha(90)
+        painter.setPen(QPen(col, z))
+        w, h = float(doc.width), float(doc.height)
+        for x in xs:
+            painter.drawLine(QPointF(x, 0.0), QPointF(x, h))
+        for y in ys:
+            painter.drawLine(QPointF(0.0, y), QPointF(w, y))
+
+    def _paint_snap_lines(self, painter):
+        """拖动时把命中的那些线画成醒目的洋红色（PS 的做法）。
+
+        `self._snap_lines` 的元素是 (kind, axis, pos) —— **pos 是命中后
+        那个坐标轴上的实际位置**。只给 (kind, axis) 是不够的：参考线可能
+        有好几条，图层也有好几条边，不带坐标就只能瞎画一条（曾画出斜线）。
+        """
+        if not self._snap_lines:
+            return
+        doc = self.main.doc
+        if doc is None:
+            return
+        z = 1.0 / max(self.zoom, 1e-6)
+        painter.setPen(QPen(QColor(255, 60, 190), 1.6 * z))
+        w, h = float(doc.width), float(doc.height)
+        for item in self._snap_lines:
+            if len(item) == 3:
+                k, axis, pos = item
+            else:
+                k, axis = item
+                pos = None
+            if pos is None:
+                continue
+            if axis == "x":
+                painter.drawLine(QPointF(pos, 0.0), QPointF(pos, h))
+            else:
+                painter.drawLine(QPointF(0.0, pos), QPointF(w, pos))
+
+    def _paint_rulers(self, painter, rr):
+        """画左上两条标尺带。刻度密度按当前缩放自适应（见 guides.ruler_ticks）。"""
+        (lx, ly, lw, lh), (tx, ty, tw, th) = rr
+        r = self.RULER
+        painter.fillRect(QRect(lx, ly, lw, lh), QColor(58, 58, 62))
+        painter.fillRect(QRect(tx, ty, tw, th), QColor(58, 58, 62))
+        painter.setPen(QPen(QColor(90, 90, 96), 1.0))
+        painter.drawLine(lx + lw - 1, ly, lx + lw - 1, ly + lh)
+        painter.drawLine(tx, ty + th - 1, tx + tw, ty + th - 1)
+
+        z = max(self.zoom, 1e-6)
+        # 标尺只覆盖画布区域之外的部分，但刻度从 0 开始对齐画布
+        scene = self._scene_rect(None)
+        x0, y0 = scene.left(), scene.top()
+        x1, y1 = scene.right(), scene.bottom()
+        # 顶部标尺 -> 水平刻度；左侧标尺 -> 垂直刻度
+        step_world = 1.0 / z                # 一个屏幕像素对应多少世界坐标
+        ticks, major = _guides.ruler_ticks(x0, x1, step_world, 58.0)
+        painter.setPen(QPen(QColor(150, 150, 156), 1.0))
+        fm = painter.font()
+        try:
+            fm.setPointSize(8)
+        except Exception:
+            pass
+        painter.setFont(fm)
+        for i, v in enumerate(ticks):
+            sx = int(self.mapFromScene(QPointF(v, 0.0)).x())
+            if sx < tx or sx > tx + tw:
+                continue
+            ln = 8 if i in major else 4
+            painter.drawLine(sx, ty + th - 1, sx, ty + th - 1 - ln)
+            if i in major:
+                painter.drawText(sx + 2, ty + 9, str(int(round(v))))
+        ticks, major = _guides.ruler_ticks(y0, y1, step_world, 58.0)
+        for i, v in enumerate(ticks):
+            sy = int(self.mapFromScene(QPointF(0.0, v)).y())
+            if sy < ly or sy > ly + lh:
+                continue
+            ln = 8 if i in major else 4
+            painter.drawLine(lx + lw - 1, sy, lx + lw - 1 - ln, sy)
+            if i in major:
+                painter.save()
+                painter.translate(lx + 9, sy - 2)
+                painter.rotate(-90)
+                painter.drawText(0, 0, str(int(round(v))))
+                painter.restore()
+
+    def _snap_layer_move(self, nx, ny, layer):
+        """移动图层时的吸附：对**中心 + 四条边**各试一次，取命中里最近的那个。
+
+        返回 (nx', ny', hits)。`hits` 里的元素是 (kind, axis)，直接给
+        `_paint_snap_lines` 用。旋转过的图层用变换后的实际边位置（见下）。
+
+        为什么不用旋转后的四角：转45° 的矩形四边不与坐标轴平行，
+        「边上的点吸到竖线」在视觉上说不清是哪一条 —— PS 的做法也是
+        只对**包围盒**（旋转后的 AABB）做吸附。所以这里按 AABB 算。
+        """
+        hits = []
+        bx = by = 0.0
+        found_x = False
+        found_y = False
+        best_x = None          # (kind, delta, dist)
+        best_y = None
+        vs, hs = _guides.layer_edges_and_centers(layer)
+        # layer_edges 给的是**当前** tx/ty 下的位置；我们要的是**移动后**的位置，
+        # 所以整体加上 (nx - layer.tx, ny - layer.ty)
+        ox = nx - float(layer.tx)
+        oy = ny - float(layer.ty)
+        tol = self.snap_tolerance()
+
+        def _better(cur, kind, delta, dist):
+            """**先比优先级（kind 越小越高），同级再比距离**。
+
+            只按距离挑会让「某个候选恰好也离另一条线很近」时输给了次优先的源
+            —— 与 PS 不符。PS 是「参考线优先于网格优先于图层」。
+            """
+            if cur is None:
+                return True
+            if kind != cur[0]:
+                return kind < cur[0]
+            return dist < cur[2]
+
+        if vs:
+            for c in vs:
+                cand = c + ox
+                sx, _y, h = self.apply_snap(cand, 0.0, exclude_layer=layer)
+                for k, axis in h:
+                    if axis != "x":
+                        continue
+                    d = abs(sx - cand)
+                    if d <= tol and _better(best_x, k, sx - cand, d):
+                        best_x = (k, sx - cand, d, sx)
+            if best_x is not None:
+                bx = best_x[1]
+                found_x = True
+                hits = [(best_x[0], "x", best_x[3])]
+            if found_x:
+                nx += bx
+        if hs:
+            for c in hs:
+                cand = c + oy
+                _x, sy, h = self.apply_snap(0.0, cand, exclude_layer=layer)
+                for k, axis in h:
+                    if axis != "y":
+                        continue
+                    d = abs(sy - cand)
+                    if d <= tol and _better(best_y, k, sy - cand, d):
+                        best_y = (k, sy - cand, d, sy)
+            if best_y is not None:
+                by = best_y[1]
+                found_y = True
+                hits = hits + [(best_y[0], "y", best_y[3])]
+            if found_y:
+                ny += by
+        return nx, ny, hits
+
+    def guide_hit(self, scene_pt, tol_view=5.0):
+        """场景坐标附近有没有参考线。返回 Guide 或 None。"""
+        gs = self.guides()
+        if gs is None:
+            return None
+        tol = tol_view / max(self.zoom, 1e-6)
+        x, y = float(scene_pt.x()), float(scene_pt.y())
+        best = None
+        for g in gs.guides:
+            d = abs(y - g.pos) if g.is_horizontal else abs(x - g.pos)
+            if d <= tol and (best is None or d < abs(
+                    (y - best.pos) if best.is_horizontal else (x - best.pos))):
+                best = g
+        return best
+
+    def set_snap_lines(self, hits):
+        """拖动过程中画高亮：把命中的那些线记下来，重绘时高亮显示。"""
+        self._snap_lines = list(hits)
+        self.viewport().update()
+
+    def set_clone_source(self, snap):
+        """main_window 在 Alt 采样后把 CloneSource 交给这里。"""
+        self.clone_source = snap
+        if snap is None:
+            self.clone_ring.setVisible(False)
+        else:
+            self._clone_ring_rect()
+
+    def _clone_ring_rect(self):
+        """把源位置标记挪到当前采样点。"""
+        s = self.clone_source
+        if s is None:
+            self.clone_ring.setVisible(False)
+            return
+        r = 6.0
+        self.clone_ring.setRect(QRectF(s.ox - r, s.oy - r, r * 2, r * 2))
+        self.clone_ring.setVisible(True)
+
+    def _update_shape_preview(self, p):
+        s = self._shape_start
+        if s is None:
+            return
+        self.shape_preview.setRect(QRectF(
+            min(s.x(), p.x()), min(s.y(), p.y()),
+            abs(p.x() - s.x()), abs(p.y() - s.y())))
+        self.shape_preview.setVisible(True)
+
+    def _blur_hit(self, p):
+        """模糊工具落一次。参数从工具选项条读，坐标是画布坐标。"""
+        if self.main.blur_at(p.x(), p.y()):
+            self._update_brush_ring(p)
 
     def _hit_handle(self, scene_pos):
         layer = self._handle_layer()
@@ -917,8 +1317,31 @@ class CanvasView(QGraphicsView):
             super().mousePressEvent(event)
             return
 
-        p = self.mapToScene(event.position().toPoint())
+        vp = event.position().toPoint()
+        # ---- 标尺带：拖出一条新参考线（移动工具之外都能拖）----
+        rk = self.in_ruler(vp.x(), vp.y())
+        if rk is not None:
+            self._drag_guides = {"kind": rk, "start": vp}
+            self.grad_line.setPen(QPen(QColor(255, 220, 120), 1.4))
+            self.grad_line.setLine(QLineF(vp, vp))
+            self.grad_line.setVisible(True)
+            event.accept()
+            return
+
+        p = self.mapToScene(vp)
         t = self.tool
+
+        # ---- 已有参考线：靠近就拖它（Alt 删）----
+        gh = self.guide_hit(p)
+        if gh is not None and self.tool == "move":
+            if event.modifiers() & Qt.AltModifier:
+                self.main.delete_guide(gh.id)
+                event.accept()
+                return
+            self._drag = {"role": "guide", "start": p, "guide": gh,
+                          "pos0": gh.pos, "moved": False}
+            event.accept()
+            return
 
         # 建新选区 = 放弃浮动状态，先把浮动内容盖回去；
         # 在快速蒙版模式下画选框等于"退出快速蒙版，重新选"
@@ -937,6 +1360,44 @@ class CanvasView(QGraphicsView):
             return
         if t == "text":
             self.main.create_text_layer((p.x(), p.y()))
+            event.accept()
+            return
+        if t == "picker":
+            self.main.pick_at(p.x(), p.y())
+            event.accept()
+            return
+        if t == "gradient":
+            self._drag = {"role": "grad", "start": p}
+            self._show_gradient_line(p, p)
+            event.accept()
+            return
+        if t == "clone":
+            if event.modifiers() & Qt.AltModifier:
+                self.main.clone_sample(p.x(), p.y())
+                event.accept()
+                return
+            if self.clone_source is None:
+                self.statusMessage.emit("克隆图章：先按住 Alt 点一下采样")
+                event.accept()
+                return
+            self._clone_drag = [QPointF(p)]
+            self.main.clone_stamp(p.x(), p.y())
+            event.accept()
+            return
+        if t == "heal":
+            self._heal_drag = [QPointF(p)]
+            self.main.heal_at(p.x(), p.y())
+            event.accept()
+            return
+        if t == "shape":
+            self._shape_start = QPointF(p)
+            self._update_shape_preview(p)
+            event.accept()
+            return
+        if t == "blurtool":
+            # 按一下就是一次模糊；按住拖动一路抹过去（和画笔手感一致）
+            self._blur_drag = [QPointF(p)]
+            self._blur_hit(p)
             event.accept()
             return
         if t == "magic":
@@ -984,6 +1445,7 @@ class CanvasView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        vp_move = lambda e: e.position().toPoint()
         if self._panning:
             d = event.position() - self._pan_start
             self._pan_start = event.position()
@@ -1045,9 +1507,93 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
 
+        if self._drag_guides is not None:
+            kind = self._drag_guides["kind"]
+            sp = self.mapToScene(vp_move(event))
+            cur = float(sp.y()) if kind == _guides.H_GUIDE else float(sp.x())
+            # 新参考线本身也吸一下（吸到已有参考线 / 网格上，PS 就是这样）
+            if kind == _guides.H_GUIDE:
+                cur, _y, _h = self.apply_snap(0.0, cur)
+            else:
+                cur, _x, _h = self.apply_snap(cur, 0.0)
+            self._drag_guides["cur"] = cur
+            w = float(self.main.doc.width)
+            h = float(self.main.doc.height)
+            if kind == _guides.H_GUIDE:
+                self.grad_line.setLine(QLineF(QPointF(0, cur),
+                                              QPointF(w, cur)))
+            else:
+                self.grad_line.setLine(QLineF(QPointF(cur, 0),
+                                              QPointF(cur, h)))
+            event.accept()
+            return
+
+        if self._clone_drag is not None:
+            last = self._clone_drag[-1]
+            dist = math.hypot(p.x() - last.x(), p.y() - last.y())
+            n = int(min(24, max(1, dist / max(1.0,
+                                             self.main.opts.size / 3.0)) + 1))
+            for k in range(1, n + 1):
+                u = k / float(n)
+                self.main.clone_stamp(last.x() + (p.x() - last.x()) * u,
+                                      last.y() + (p.y() - last.y()) * u)
+            self._clone_drag.append(QPointF(p))
+            event.accept()
+            return
+
+        if self._heal_drag is not None:
+            # 补样间距用 size/2（比克隆粗：修复本来就是一片一片的）
+            last = self._heal_drag[-1]
+            dist = math.hypot(p.x() - last.x(), p.y() - last.y())
+            n = int(min(24, max(1, dist / max(1.0,
+                                             self.main.opts.size / 2.0)) + 1))
+            for k in range(1, n + 1):
+                u = k / float(n)
+                self.main.heal_at(last.x() + (p.x() - last.x()) * u,
+                                  last.y() + (p.y() - last.y()) * u)
+            self._heal_drag.append(QPointF(p))
+            event.accept()
+            return
+
+        if self._shape_start is not None:
+            self._update_shape_preview(p)
+            event.accept()
+            return
+
+        if self._blur_drag is not None:
+            # 落点之间补线，否则快速拖动会漏成一串珠子
+            last = self._blur_drag[-1]
+            dist = math.hypot(p.x() - last.x(), p.y() - last.y())
+            n = int(min(24, max(1, dist / max(1.0,
+                                             self.main.opts.size / 3.0)) + 1))
+            for k in range(1, n + 1):
+                u = k / float(n)
+                self._blur_hit(QPointF(last.x() + (p.x() - last.x()) * u,
+                                       last.y() + (p.y() - last.y()) * u))
+            self._blur_drag.append(QPointF(p))
+            event.accept()
+            return
+
         if self._drag is not None:
+            if self._drag.get("role") == "grad":
+                self._show_gradient_line(self._drag["start"], p)
+                event.accept()
+                return
             self._apply_drag(p, event.modifiers())
             event.accept()
+            return
+
+        if self.tool in BLUR_TOOLS or self.tool in CLONE_TOOLS:
+            self.setCursor(Qt.CrossCursor)
+            self._update_brush_ring(p)
+            if self.tool in CLONE_TOOLS:
+                self._clone_ring_rect()
+            super().mouseMoveEvent(event)
+            return
+
+        if self.tool in SHAPE_TOOLS:
+            self.setCursor(Qt.CrossCursor)
+            super().mouseMoveEvent(event)
             return
 
         if self.tool in PAINT_TOOLS:
@@ -1056,7 +1602,7 @@ class CanvasView(QGraphicsView):
             super().mouseMoveEvent(event)
             return
 
-        if self.tool == "text":
+        if self.tool in ("text", "gradient", "picker"):
             self.setCursor(Qt.CrossCursor)
             super().mouseMoveEvent(event)
             return
@@ -1100,6 +1646,60 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
 
+        if self._drag_guides is not None:
+            cur = self._drag_guides.get("cur")
+            kind = self._drag_guides["kind"]
+            self._drag_guides = None
+            self.grad_line.setVisible(False)
+            if cur is not None and self.main.doc is not None:
+                self.main.add_guide(kind, cur)
+            event.accept()
+            return
+
+        if self._drag is not None and self._drag.get("role") == "guide":
+            g = self._drag["guide"]
+            newpos = self._drag.get("newpos")
+            self._drag = None
+            if newpos is not None:
+                self.main.move_guide(g.id, newpos)
+            event.accept()
+            return
+
+        if self._clone_drag is not None:
+            # clone_stamp 每次都已经 commit 过了，这里只清轨迹
+            self._clone_drag = None
+            event.accept()
+            return
+
+        if self._heal_drag is not None:
+            # heal_at 每次都已经 commit 过了，这里只清轨迹
+            self._heal_drag = None
+            event.accept()
+            return
+
+        if self._shape_start is not None:
+            st = self._shape_start
+            self._shape_start = None
+            self._hide_shape_preview()
+            self.main.draw_shape((st.x(), st.y()), (p.x(), p.y()),
+                                 modifiers=event.modifiers())
+            event.accept()
+            return
+
+        if self._blur_drag is not None:
+            # blur_at 每次都已经 commit 过了，这里只清轨迹
+            self._blur_drag = None
+            event.accept()
+            return
+
+        if self._drag is not None and self._drag.get("role") == "grad":
+            st = self._drag["start"]
+            self._drag = None
+            self._hide_gradient_line()
+            self.main.apply_gradient_drag((st.x(), st.y()), (p.x(), p.y()))
+            event.accept()
+            return
+
         if self._sel_drag is not None:
             d = self._sel_drag
             sel = self._preview_sel
@@ -1139,8 +1739,23 @@ class CanvasView(QGraphicsView):
 
     def _apply_drag(self, p, modifiers):
         d = self._drag
-        layer = d["layer"]
         d["moved"] = True
+
+        if d["role"] == "guide":
+            # 拖参考线：跟着鼠标走，松开才落（落点走吸附）
+            g = d["guide"]
+            raw = float(p.y()) if g.is_horizontal else float(p.x())
+            if g.is_horizontal:
+                np_, _y, hits = self.apply_snap(0.0, raw)
+            else:
+                np_, _x, hits = self.apply_snap(raw, 0.0)
+            d["newpos"] = np_
+            self.set_snap_lines(hits)
+            g.pos = np_                    # 先动，松手由 main_window 落撤销点
+            self.rebuild_guide_items()
+            return
+
+        layer = d["layer"]
         before = self._layer_dirty_rect(layer)   # 改动之前占的位置
 
         if d["role"] == "float_pending":
@@ -1159,8 +1774,15 @@ class CanvasView(QGraphicsView):
                     dy = 0.0
                 else:
                     dx = 0.0
-            layer.tx = d["tx"] + dx
-            layer.ty = d["ty"] + dy
+            nx = d["tx"] + dx
+            ny = d["ty"] + dy
+            # 吸附（Ctrl 临时关闭，PS 就是这个键）。层自身不参与 ——
+            # 否则它自己的边缘会把自己吸住不动
+            if not (modifiers & Qt.ControlModifier):
+                nx, ny, hits = self._snap_layer_move(nx, ny, layer)
+                self.set_snap_lines(hits)
+            layer.tx = nx
+            layer.ty = ny
             self._render_moved(before, layer)
             self._update_handles()
             self.statusMessage.emit("位置: %.0f, %.0f" % (layer.tx, layer.ty))

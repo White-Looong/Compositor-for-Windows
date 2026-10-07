@@ -3,3 +3,4 @@ numpy>=1.24
 opencv-python>=4.8
 Pillow>=10.0
 psd-tools>=1.10      # PSD 导入（可选，没装也能跑，只是不能导入 PSD）
+pillow-heif>=1.7     # HEIC / HEIF 导入（可选，没装也不能跑，只是不能读手机照片）

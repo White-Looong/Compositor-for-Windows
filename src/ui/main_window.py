@@ -20,6 +20,8 @@ from ..core.adjust import ADJUSTMENTS, ADJUST_ORDER
 from ..core.brush import clear_rgba, fill_rgba
 from ..core.document import (Document, make_adjustment_layer, make_group,
                              make_image_layer, make_text_layer)
+from ..core.content_aware import (extend_canvas_content_aware,
+                                  fill_content_aware)
 from ..core.filters import (FILTERS, FILTER_ORDER, apply_filter_array,
                             preview_can_downscale, preview_filter_scale,
                             scale_filter_params)
@@ -28,7 +30,9 @@ from ..core.layer import LAYER_IMAGE
 from ..core.paint import _gray
 from ..core.project_io import (PROJECT_EXT, export_flat, imread_rgba,
                                load_project, save_project)
+from ..core import guides as _guides
 from ..core import quick_mask
+from ..core import retouch
 from ..core import channels as _ch
 from ..core.psd_import import (PSD_EXT, STATS, is_available as psd_available,
                                load_psd)
@@ -41,6 +45,7 @@ from ..core.smart import (content_instances, convert_to_smart, new_filter,
                           rasterize_smart, refresh_sizes, sync_smart)
 from ..core.text import sync_text_image
 from .canvas_view import CanvasView
+from .content_aware_dialog import ContentAwareDialog
 from .filter_dialog import FilterDialog
 from .channels_panel import ROLE_MASK as _CH_ROLE_MASK, ChannelsPanel
 from .inspector import Inspector
@@ -58,6 +63,12 @@ TOOLS = [
     ("brush", "画笔", "B", "画笔（可画在像素或蒙版上）"),
     ("eraser", "橡皮", "E", "橡皮擦：擦成透明"),
     ("fill", "填充", "G", "油漆桶：用前景色填充"),
+    ("gradient", "渐变", "Shift+G", "拖出一条线画渐变（5 种样式，前景色 → 背景色）"),
+    ("blurtool", "模糊", "Shift+B", "局部模糊：按住拖动，笔刷盖住的地方被高斯模糊"),
+    ("picker", "吸管", "Shift+I", "吸管：点一下取色到前景色（Alt 点取背景色）"),
+    ("clone", "克隆", "Shift+C", "克隆图章：按住 Alt 采样，松开拖动盖章"),
+    ("heal", "修复", "Shift+H", "污点修复：点/拖过瑕点，用周围纹理补上"),
+    ("shape", "形状", "Shift+U", "形状工具：拖出矩形 / 椭圆 / 直线"),
     ("text", "文字", "T", "点击画布创建文字图层（之后在属性面板里改）"),
     ("hand", "抓手", "H", "平移画布（按住空格可临时切换）"),
 ]
@@ -100,7 +111,8 @@ def _union(rects):
             max(r[2] for r in rects), max(r[3] for r in rects))
 TILE_EDGE = 1024           # 瓦片边长（画布像素）。实测 24 MP：1920 MB -> 357 MB，+30% 耗时
 
-IMG_FILTER = "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff);;所有文件 (*.*)"
+IMG_FILTER = ("图片文件 (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff "
+              "*.heic *.heif *.svg);;所有文件 (*.*)")
 PROJ_FILTER = "Compositor 工程 (*%s);;所有文件 (*.*)" % PROJECT_EXT
 PSD_FILTER = "Photoshop 文档 (*%s);;所有文件 (*.*)" % PSD_EXT
 
@@ -319,12 +331,68 @@ class MainWindow(QMainWindow):
                                          lambda _c=False, k=key:
                                          self.ask_filter(k)))
 
+        m_retool = self.menuBar().addMenu("修饰")
+        m_retool.addAction(self._act("渐变…", "", lambda: self.set_tool("gradient"),
+                                     "拖一条线画渐变（Shift+G）"))
+        m_retool.addAction(self._act("局部模糊", "Shift+B",
+                                     lambda: self.set_tool("blurtool"),
+                                     "按住拖动，只糊笔刷盖住的地方"))
+        m_retool.addSeparator()
+        m_retool.addAction(self._act("前景色 ← 吸管", "Shift+I",
+                                     lambda: self.set_tool("picker"),
+                                     "点一下取色到前景色"))
+        m_retool.addAction(self._act(
+            "克隆图章", "Shift+C", lambda: self.set_tool("clone"),
+            "按住 Alt 采样，松开拖动盖章"))
+        m_retool.addAction(self._act(
+            "污点修复", "Shift+H", lambda: self.set_tool("heal"),
+            "点过瑕点，用周围的纹理补上"))
+        m_retool.addAction(self._act(
+            "形状…", "Shift+U", lambda: self.set_tool("shape"),
+            "拖出矩形 / 椭圆 / 直线"))
+        m_retool.addSeparator()
+        m_retool.addAction(self._act(
+            "前景色 ← 背景色", "X",
+            # lambda 包一层：opts 是菜单建好之后才挂上来的
+            lambda: self.opts.swap_colors()))
+
+        m_img = self.menuBar().addMenu("图像")
+        m_img.addAction(self._act(
+            "画布大小…", "Ctrl+Alt+C", self.ask_canvas_size,
+            "给画布加边：底色、透明，或者用内容感知的方式把边缘长出去"))
+        m_img.addAction(self._act(
+            "按内容裁剪", "", self.trim_to_content,
+            "把四周全空的区域裁掉"))
+
         m_view = self.menuBar().addMenu("视图")
         m_view.addAction(self._act("适应窗口", "Ctrl+0", self.view.fit))
         m_view.addAction(self._act("实际像素", "Ctrl+1", self.view.zoom_actual))
         m_view.addAction(self._act("放大", "Ctrl++", lambda: self.view.set_zoom(self.view.zoom * 1.25)))
         m_view.addAction(self._act("缩小", "Ctrl+-", lambda: self.view.set_zoom(self.view.zoom / 1.25)))
         m_view.addSeparator()
+        m_guide = self.menuBar().addMenu("向导")
+        m_guide.addAction(self._act(
+            "标尺", "Ctrl+Shift+R", lambda: self.set_rulers(not self.view.show_rulers),
+            "显示 / 隐藏左上两条标尺"))
+        m_guide.addAction(self._act(
+            "网格", "Ctrl+Shift+'", lambda: self.set_grid(on=not self.doc.guides.grid.visible),
+            "显示 / 隐藏布局网格"))
+        m_guide.addAction(self._act(
+            "吸附", "", lambda: self.set_snap(
+                "all", not self.doc.guides.snap_guides),
+            "总开关（按住 Ctrl 临时切换）"))
+        m_guide.addSeparator()
+        for nm, key in (("吸附到文档边界", "doc"), ("吸附到参考线", "guides"),
+                        ("吸附到网格", "grid"), ("吸附到图层", "layers")):
+            m_guide.addAction(self._act(
+                nm, "", (lambda k: lambda: self.set_snap(k, not getattr(
+                    self.doc.guides, {"doc": "snap_doc", "guides": "snap_guides",
+                                      "grid": "snap_grid",
+                                      "layers": "snap_layers"}[k])))(key)))
+        m_guide.addSeparator()
+        m_guide.addAction(self._act("清除全部参考线", "", self.clear_guides,
+                                    "Alt + 点击某条参考线也能单独删"))
+
         m_view.addAction(self._act("通道面板", "F2", self.toggle_channels_dock,
                                    "显示 / 隐藏通道面板"))
         m_view.addAction(self._act("图层面板", "", self.panel_dock.setVisible,
@@ -381,6 +449,9 @@ class MainWindow(QMainWindow):
                                   lambda: self.fill_with_fg(None, use_fg=True)))
         m_sel.addAction(self._act("用背景色填充", "Ctrl+Delete",
                                   lambda: self.fill_with_fg(None, use_fg=False)))
+        m_sel.addAction(self._act(
+            "内容感知填充…", "Shift+Ctrl+F", self.ask_content_aware_fill,
+            "用选区周围的像素推断出选区里该是什么；可实时预览"))
         m_sel.addAction(self._act("清除选区内容", "Delete", self.delete_in_selection))
         m_sel.addSeparator()
         m_sel.addAction(self._act("存储为蒙版", "", self.mask_from_selection))
@@ -902,7 +973,8 @@ class MainWindow(QMainWindow):
             return
         for p in paths:
             try:
-                arr = imread_rgba(p)
+                # SVG 是矢量，尺寸按画布走（不然一张 16×16 的图标会挤在角落里）
+                arr = imread_rgba(p, target=(self.doc.width, self.doc.height))
             except Exception as e:
                 QMessageBox.warning(self, "导入失败", "%s\n%s" % (p, e))
                 continue
@@ -2007,6 +2079,405 @@ class MainWindow(QMainWindow):
         self.request_render()
         self.inspector.refresh()
 
+    # ---------- 修饰类工具（core/retouch.py）----------
+
+    def _retouch_target_layer(self, what):
+        """修饰类工具要改像素时的统一前置检查。返回图层或 None。"""
+        if quick_mask.is_on(self.doc):
+            self.status.showMessage(
+                "快速蒙版模式下「%s」不可用，先退出快速蒙版" % what, 4000)
+            return None
+        layer = self.selected_layer()
+        if layer is None or layer.is_group:
+            self.status.showMessage("先选中一个图层")
+            return None
+        if layer.image is None and not layer.is_adjustment:
+            self.status.showMessage("这个图层没有像素可改")
+            return None
+        if self._reject_text_layer(what):
+            return None
+        if layer.locked:
+            self.status.showMessage("图层已锁定")
+            return None
+        return layer
+
+    def apply_gradient_drag(self, start, end, layer=None):
+        """渐变工具：把 start→end 的渐变涂进图层。
+
+        拖动坐标是画布坐标，要逆变换到图层源坐标 —— 渐变得跟着图层走，
+        图层缩放过之后渐变范围也要跟着缩。选区存在时只涂选区内。
+        一次拖动 = 一个撤销点。
+        """
+        layer = layer or self._retouch_target_layer("渐变")
+        if layer is None:
+            return False
+        params = self.opts.gradient_params()
+        Minv = cv2.invertAffineTransform(layer.matrix())
+        p0 = cv2.transform(np.array([[[start[0], start[1]]]], np.float32),
+                           Minv)[0, 0]
+        p1 = cv2.transform(np.array([[[end[0], end[1]]]], np.float32),
+                           Minv)[0, 0]
+        sel = self._src_selection(layer)
+        on_mask = (self.opts.target == "mask" and layer.mask is not None)
+        self.doc.detach_pixels(layer)
+        if on_mask:
+            col = retouch.gradient_colors(layer.mask.shape, p0, p1, params)
+            v = col.mean(axis=2) * 255.0
+            if sel is None:
+                layer.mask = np.clip(v, 0, 255).astype(np.uint8)
+            else:
+                m = layer.mask.astype(np.float32)
+                layer.mask = np.clip(m * (1 - sel) + v * sel,
+                                     0, 255).astype(np.uint8)
+        else:
+            retouch.apply_gradient(layer.image, p0, p1, params, sel)
+        self.after_pixel_edit("渐变")
+        return True
+
+    def blur_at(self, x, y, params=None, layer=None):
+        """模糊工具：在 (x,y)（画布坐标）落一次模糊。
+
+        和画笔一样是**增量**的 —— 每次只处理落点附近那一块，
+        大图层上按住拖动才不会卡。
+        """
+        layer = layer or self._retouch_target_layer("模糊")
+        if layer is None:
+            return False
+        p = params or self.opts.blur_params()
+        rad = p["size"] / 2.0
+        if layer.is_adjustment:
+            if layer.mask is None:
+                self.status.showMessage("调整层的蒙版不存在，先加个蒙版")
+                return False
+            self.doc.detach_pixels(layer)
+            # 蒙版是灰度：造一份 RGBA 副本去卷积，取回灰度那一路
+            h, w = layer.mask.shape
+            tmp = np.zeros((h, w, 4), np.uint8)
+            tmp[..., 0] = tmp[..., 1] = tmp[..., 2] = layer.mask
+            tmp[..., 3] = 255
+            retouch.blur_region(tmp, x, y, rad, p["hardness"], p["strength"])
+            newm = tmp[..., 0].astype(np.float32)
+            sel = self._sel()
+            if sel is not None and not sel.is_empty:
+                m = layer.mask.astype(np.float32)
+                newm = m * (1 - sel.float_mask()) + newm * sel.float_mask()
+            layer.mask = np.clip(newm, 0, 255).astype(np.uint8)
+        else:
+            if layer.is_smart:
+                self.status.showMessage(
+                    "智能对象不能直接模糊 —— 用「编辑内容」或先栅格化", 5000)
+                return False
+            self.doc.detach_pixels(layer)
+            Minv = cv2.invertAffineTransform(layer.matrix())
+            src = cv2.transform(np.array([[[x, y]]], np.float32), Minv)[0, 0]
+            # 半径以画布像素计；图层缩放过，源坐标里的半径要一起缩
+            sc = float(layer.sx or 1.0)
+            retouch.blur_region(layer.image, src[0], src[1], rad * sc,
+                                p["hardness"], p["strength"])
+        self.after_pixel_edit("模糊")
+        return True
+
+    def _retouch_src_layer(self, what, layer):
+        """把画布坐标换算到图层源坐标，顺带给一个"源坐标里的半径换算系数"。
+
+        返回 (Minv, scale) 或 None。`scale` 是画布像素 -> 源像素的缩放，
+        模糊 / 克隆 / 修复的半径都要乘它 —— 图层缩放过之后笔刷半径得跟着缩，
+        否则视觉上的笔触大小就不对。
+        """
+        Minv = cv2.invertAffineTransform(layer.matrix())
+        m = layer.matrix()
+        det = abs(m[0, 0] * m[1, 1] - m[0, 1] * m[1, 0])
+        return Minv, float(np.sqrt(max(det, 1e-9)))
+
+    def clone_sample(self, x, y, params=None):
+        """克隆图章：按住 Alt 时对当前图层拍一张快照。返回 CloneSource 或 None。
+
+        拍的是**图层源图像**，并且是副本 —— 之后无论源图层怎么改，这份快照不变。
+        否则在同一张图上克隆会「边涂边采到自己的新颜料」，越涂越花。
+        """
+        layer = self._retouch_target_layer("克隆图章")
+        if layer is None or layer.is_adjustment:
+            return None
+        if layer.is_smart:
+            self.status.showMessage("智能对象不能直接克隆 —— 先栅格化", 4000)
+            return None
+        p = params or self.opts.clone_params()
+        Minv = cv2.invertAffineTransform(layer.matrix())
+        src = cv2.transform(np.array([[[x, y]]], np.float32), Minv)[0, 0]
+        h, w = layer.image.shape[:2]
+        if not (0 <= src[0] < w and 0 <= src[1] < h):
+            self.status.showMessage("Alt 采样要点在图层有像素的地方", 4000)
+            return None
+        snap = retouch.CloneSource(layer.image.copy(), int(round(src[0])),
+                                  int(round(src[1])), p["hardness"],
+                                  int(p["size"]))
+        self.view.set_clone_source(snap)
+        self.status.showMessage(
+            "已采样源坐标 (%d, %d) —— 移动鼠标后左键盖章，Alt 重新采样"
+            % (snap.ox, snap.oy), 4000)
+        return snap
+
+    def clone_stamp(self, x, y, params=None):
+        """克隆图章：落一次章（拖动时 canvas_view 会补样成 path）。"""
+        snap = self.view.clone_source
+        if snap is None:
+            self.status.showMessage("克隆图章：先按住 Alt 点一下采样", 4000)
+            return False
+        layer = self._retouch_target_layer("克隆图章")
+        if layer is None or layer.is_adjustment:
+            return False
+        if layer.is_smart:
+            self.status.showMessage("智能对象不能直接克隆 —— 先栅格化", 4000)
+            return False
+        p = params or self.opts.clone_params()
+        got = self._retouch_src_layer("克隆图章", layer)
+        if got is None:
+            return False
+        Minv, scale = got
+        src = cv2.transform(np.array([[[x, y]]], np.float32), Minv)[0, 0]
+        if snap.shape != layer.image.shape[:2]:
+            self.status.showMessage("采样时的图层尺寸与现在不一致（撤销过？）", 4000)
+            return False
+        self.doc.detach_pixels(layer)
+        ok = retouch.clone_stamp_at(layer.image, snap, src[0], src[1],
+                                    p["size"] / 2.0 * scale, p["hardness"],
+                                    p["strength"])
+        if not ok:
+            return False
+        self.after_pixel_edit("克隆图章")
+        return True
+
+    def heal_at(self, x, y, params=None):
+        """污点修复：把 (x,y) 附近的瑕点用周围纹理补上。"""
+        layer = self._retouch_target_layer("污点修复")
+        if layer is None:
+            return False
+        p = params or self.opts.clone_params()
+        if layer.is_adjustment:
+            if layer.mask is None:
+                self.status.showMessage("调整层的蒙版不存在，先加个蒙版")
+                return False
+            self.doc.detach_pixels(layer)
+            h, w = layer.mask.shape
+            tmp = np.zeros((h, w, 4), np.uint8)
+            tmp[..., 0] = tmp[..., 1] = tmp[..., 2] = layer.mask
+            tmp[..., 3] = 255
+            if not retouch.heal_region(tmp, x, y, p["size"] / 2.0,
+                                      p["hardness"], p["strength"]):
+                return False
+            layer.mask = tmp[..., 0]
+        else:
+            if layer.is_smart:
+                self.status.showMessage(
+                    "智能对象不能直接修复 —— 用「编辑内容」或先栅格化", 5000)
+                return False
+            self.doc.detach_pixels(layer)
+            Minv, scale = self._retouch_src_layer("污点修复", layer)
+            src = cv2.transform(np.array([[[x, y]]], np.float32), Minv)[0, 0]
+            if not retouch.heal_region(layer.image, src[0], src[1],
+                                       p["size"] / 2.0 * scale,
+                                       p["hardness"], p["strength"]):
+                return False
+        self.after_pixel_edit("污点修复")
+        return True
+
+    def draw_shape(self, p0, p1, params=None, modifiers=None):
+        """形状工具：在 p0→p1 之间落一个矩形 / 椭圆 / 直线。
+
+        `modifiers` 里 Shift 表示等比 / 正圆 / 45° 直线（和选区工具一致）。
+        """
+        layer = self._retouch_target_layer("形状")
+        if layer is None:
+            return False
+        p = params or self.opts.shape_params()
+        x0, y0 = float(p0[0]), float(p0[1])
+        x1, y1 = float(p1[0]), float(p1[1])
+        shift = bool(modifiers and modifiers & Qt.ShiftModifier)
+        kind = p["kind"]
+        Minv, scale = self._retouch_src_layer("形状", layer)
+        a = cv2.transform(np.array([[[x0, y0]]], np.float32), Minv)[0, 0]
+        b = cv2.transform(np.array([[[x1, y1]]], np.float32), Minv)[0, 0]
+        ax, ay = float(a[0]), float(a[1])
+        bx, by = float(b[0]), float(b[1])
+        if shift:
+            if kind == "直线":
+                # 45° 吸附：取 dx / dy 里绝对值大的那个作为主轴
+                if abs(bx - ax) >= abs(by - ay):
+                    by = ay
+                else:
+                    bx = ax
+            else:
+                # 等比：取较大的边长当边长
+                s = max(abs(bx - ax), abs(by - ay))
+                bx = ax + (s if bx >= ax else -s)
+                by = ay + (s if by >= ay else -s)
+
+        h, w = layer.image.shape[:2]
+        ix0, iy0 = int(round(min(ax, bx))), int(round(min(ay, by)))
+        ix1, iy1 = int(round(max(ax, bx))), int(round(max(ay, by)))
+        ix0, iy0 = max(0, ix0), max(0, iy0)
+        ix1, iy1 = min(w, ix1), min(h, iy1)
+        if ix1 <= ix0 or iy1 <= iy0:
+            self.status.showMessage("形状太小了")
+            return False
+        bw = max(1, int(round(abs(bx - ax) * max(scale, 0.5))))
+        bh = max(1, int(round(abs(by - ay) * max(scale, 0.5))))
+        sel = np.zeros((iy1 - iy0, ix1 - ix0), np.float32)
+        yy, xx = np.mgrid[iy0:iy1, ix0:ix1]
+        cx = (ax + bx) / 2.0
+        cy = (ay + by) / 2.0
+        # 先建一个全 False 的：Python 判定局部变量看整个函数体，
+        # 分支里才赋值的话另一个分支读它会 UnboundLocalError
+        inside = np.zeros(sel.shape, bool)
+        if kind == "椭圆":
+            inside = (((xx + 0.5 - cx) / (bw / 2.0 + 1e-6)) ** 2 +
+                      ((yy + 0.5 - cy) / (bh / 2.0 + 1e-6)) ** 2) <= 1.0
+        elif kind == "直线":
+            # 直线：沿方向的矩形带，宽度就是笔刷大小
+            if abs(by - ay) <= 1e-6:
+                inside = np.abs(yy + 0.5 - ay) <= bh / 2.0
+            else:
+                t = (yy + 0.5 - ay) / (by - ay)
+                cx_line = ax + (bx - ax) * t
+                inside = np.abs(xx + 0.5 - cx_line) <= bw / 2.0
+        else:
+            inside = np.ones(sel.shape, bool)
+        # fill_rgba 要求 sel 与 image 同尺寸，把形状框铺回整幅
+        # （用 numpy 而不是循环，避免一张 12 MP 的临时数组）
+        full = np.zeros((h, w), np.float32)
+        full[iy0:iy1, ix0:ix1] = inside.astype(np.float32)
+        if p["outline"]:
+            # **必须给 borderType / borderValue**：默认的 border 处理会把
+            # 外沿也吃掉，描边就没了（实测整圈全 0）。给 BORDER_CONSTANT=0
+            # 之后「画布外当作空」-> 外沿保住了，这正是描边要的
+            er = cv2.erode(full, np.ones((3, 3), np.uint8),
+                           iterations=max(1, int(round(min(bw, bh) * 0.06))),
+                           borderType=cv2.BORDER_CONSTANT, borderValue=0)
+            full = np.clip(full - er.astype(np.float32), 0.0, 1.0)
+        sel = full
+        # 选区约束（画布坐标的选区换算过来）
+        user_sel = self._src_selection(layer)
+        if user_sel is not None:
+            sel = sel * user_sel
+        color = self.opts.fg.rgb()
+        self.doc.detach_pixels(layer)
+        fill_rgba(layer.image, sel, color)
+        self.after_pixel_edit("形状")
+        return True
+
+    # ---------- 向导：参考线 / 网格 / 吸附（第二十一批）----------
+
+    def add_guide(self, kind, pos):
+        """新增一条参考线。返回 Guide 或 None（没文档时）。"""
+        if self.doc is None:
+            return None
+        g = self.doc.guides.add(kind, float(pos))
+        self.commit("添加参考线")
+        self.view.rebuild_guide_items()
+        self.status.showMessage(
+            "已添加%s参考线 @ %.0f（拖动可移动，Alt+点击可删除）"
+            % ("水平" if kind == _guides.H_GUIDE else "垂直", g.pos), 3000)
+        return g
+
+    def move_guide(self, gid, pos):
+        """移动一条参考线。拖动过程中已经直接改过pos，这里只落撤销点。"""
+        g = self.doc.guides.find(gid) if self.doc is not None else None
+        if g is None:
+            return False
+        g.pos = float(pos)
+        self.commit("移动参考线")
+        self.view.rebuild_guide_items()
+        return True
+
+    def delete_guide(self, gid):
+        if self.doc is None or not self.doc.guides.remove(gid):
+            return False
+        self.commit("删除参考线")
+        self.view.rebuild_guide_items()
+        self.status.showMessage("已删除参考线", 2000)
+        return True
+
+    def clear_guides(self):
+        if self.doc is None or not self.doc.guides.guides:
+            return False
+        self.doc.guides.clear()
+        self.commit("清除全部参考线")
+        self.view.rebuild_guide_items()
+        self.status.showMessage("已清除全部参考线", 2000)
+        return True
+
+    def set_rulers(self, on):
+        """标尺显隐。开了之后画布可视区会内缩标尺的宽度。"""
+        self.view.show_rulers = bool(on)
+        self.view.update()
+        self.status.showMessage("标尺：%s" % ("显示" if on else "隐藏"), 2000)
+
+    def set_grid(self, on=None, spacing=None, subdiv=None):
+        """网格开关 / 间距 / 细分。参数为 None 表示不改那项。"""
+        gs = self.doc.guides if self.doc is not None else None
+        if gs is None:
+            return False
+        if on is not None:
+            gs.grid.visible = bool(on)
+        if spacing is not None:
+            gs.grid.spacing = max(1.0, float(spacing))
+        if subdiv is not None:
+            gs.grid.subdiv = max(1, int(subdiv))
+        self.view.sync_grid()
+        self.commit("网格设置")
+        self.status.showMessage(
+            "网格：%s · 间距 %.0f px · %d 等分"
+            % ("显示" if gs.grid.visible else "隐藏", gs.grid.spacing,
+               gs.grid.subdiv), 3000)
+        return True
+
+    def set_snap(self, which=None, on=None):
+        """吸附开关。which 取 doc / guides / grid / layers / all。"""
+        gs = self.doc.guides if self.doc is not None else None
+        if gs is None:
+            return False
+        names = {"doc": "snap_doc", "guides": "snap_guides",
+                 "grid": "snap_grid", "layers": "snap_layers"}
+        if which is None or which == "all":
+            for attr in names.values():
+                setattr(gs, attr, bool(on))
+        else:
+            attr = names.get(which)
+            if attr is None:
+                return False
+            setattr(gs, attr, bool(on))
+        self.view.sync_grid()
+        self.view.viewport().update()
+        return True
+
+    def pick_at(self, x, y, params=None):
+        """吸管：取色到前景色。返回 (r,g,b) 或 None。"""
+        p = params or self.opts.pick_params()
+        if quick_mask.is_on(self.doc):
+            qm = self.doc.quick_mask
+            src = np.dstack([qm, np.full(qm.shape, 255, np.uint8)])
+            got = retouch.pick_color(src, x, y, p["radius"])
+            if got is None:
+                self.status.showMessage("取样失败：点在画布外", 3000)
+                return None
+            g = int(got[0])
+            self.opts.fg.set_color((g, g, g))
+            self.status.showMessage("已取样 灰度 %d（快速蒙版遮罩）" % g, 3000)
+            return (g, g, g)
+        from_composite = bool(p["composite"]) and self._last_arr is not None
+        arr = self._last_arr if from_composite else (
+            self.selected_layer().image if self.selected_layer() else None)
+        got = retouch.pick_color(arr, x, y, p["radius"])
+        if got is None:
+            self.status.showMessage("取样失败：点在画布外或这里没有内容", 3000)
+            return None
+        r, g, b = int(got[0]), int(got[1]), int(got[2])
+        self.opts.fg.set_color((r, g, b))
+        where = "合成结果" if from_composite else "当前图层"
+        self.status.showMessage("已取样 %s RGB(%d, %d, %d)" % (where, r, g, b),
+                                3000)
+        return (r, g, b)
+
     # ---------- 蒙版 ----------
 
     def add_mask(self, kind):
@@ -2119,6 +2590,176 @@ class MainWindow(QMainWindow):
         self.inspector.refresh()
         self.request_render()
         self.view.update_selection_overlay()
+
+    # ---------- 内容感知填充（core/content_aware.py）----------
+
+    def ask_content_aware_fill(self):
+        """选择 → 内容感知填充…：用选区周围的像素推断选区里该是什么。
+
+        和 `fill_with_fg` 的区别：不填颜色，**填内容** —— 挖掉一块电线杆，
+        填回来的是它背后的天空/墙面纹理。
+
+        对话框开着的时候反复重算（纹理合成模式下一次要几百 ms，所以做在
+        `_on_caf_preview` 里带 try/except，失败就跳过这一帧）；
+        「确定」才落撤销点，「取消」把原图整块写回去。
+        """
+        if not self._require_doc():
+            return
+        layer = self._retouch_target_layer("内容感知填充")
+        if layer is None:
+            return
+        sel = self._sel()
+        if sel is None or sel.is_empty:
+            self.status.showMessage("先做一个选区 —— 内容感知填充靠选区定位", 5000)
+            return
+        src = layer.image.copy()          # 破坏性试错的底稿
+        lid = layer.id
+        src_sel = self._src_selection(layer)
+
+        dlg = ContentAwareDialog(self)
+        dlg.paramsChanged.connect(
+            lambda p: self._on_caf_preview(lid, src, src_sel, p))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            # 取消：把底稿写回去。**必须 doc.find(id) 重取** ——
+            # 预览期间 commit 过的话，layer 已经是新对象了
+            cur = self.doc.find(lid)
+            if cur is not None:
+                cur.image = src
+                self.request_render()
+            return
+        p = dlg.values()
+        cur = self.doc.find(lid)
+        if cur is None or cur.image is None:
+            return
+        self.doc.detach_pixels(cur)
+        cur.image = fill_content_aware(cur.image, src_sel, **p)
+        self.after_pixel_edit("内容感知填充")
+
+    def _on_caf_preview(self, lid, src, src_sel, params):
+        """对话框的实时预览。失败（超时/超大选区）就跳过这一帧。"""
+        if self.doc is None:
+            return
+        cur = self.doc.find(lid)
+        if cur is None or cur.image is None:
+            return
+        self.doc.detach_pixels(cur)
+        try:
+            out = fill_content_aware(src, src_sel, **params)
+        except (cv2.error, MemoryError, ValueError):
+            return
+        cur.image = out
+        self.request_render()
+
+    def ask_canvas_size(self):
+        """图像 → 画布大小…：给画布加边。
+
+        新加出来的边有三种填法：
+        - 前景色 / 透明 / 白色
+        - **内容感知**：把边缘"长"出去 —— 这是 Photoshop 的
+          「扩展画布外的空白」，本项目对**所有位图图层**都做一遍，
+          所以边缘看起来是连续的，而不是突然多一圈。
+        """
+        if not self._require_doc():
+            return
+        from .canvas_size_dialog import CanvasSizeDialog
+        dlg = CanvasSizeDialog(self, self.doc,
+                               color=tuple(self.opts.fg.rgb()))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        vals = dlg.values()
+        self.resize_canvas(**vals)
+        self.commit("画布大小")
+        self.inspector.refresh()
+        self.request_render()
+        self.view.update_selection_overlay()
+
+    def resize_canvas(self, width, height, anchor="居中", fill="内容感知",
+                      color=None, mode="邻近"):
+        """真正干活的画布大小。anchor 是 3x3 锚点（九宫格）。
+
+        内容感知那一条路：先算出各边**扩出多少像素**，逐个位图图层
+        各自 `extend_canvas_content_aware` 一次。之所以要逐层做而不是
+        只在合成结果上做 —— 图层是可以分开编辑的，合成图上长出来的
+        边缘没法分配回各层。
+        """
+        from ..core.document import _ANCHOR_OFFSETS
+        ow, oh = self.doc.width, self.doc.height
+        nw, nh = max(1, int(width)), max(1, int(height))
+        # 锚点是 0~1 的比例，要按**新旧尺寸之差**换算成整数像素。
+        # 直接拿比例乘新尺寸会在「只扩 10px」时算出 0.5px，取整就丢了一边。
+        #
+        # dx 是**原图整体右移多少**：fx=0（左上）不移，fx=1（右下）全移。
+        # 所以左边扩出来的是 dx，右边扩出来的是差值剩下的那部分 ——
+        # 两个都要独立算，只看其中一个会在 fx=0 或 1 时漏掉一整边。
+        fx, fy = _ANCHOR_OFFSETS[anchor]
+        grow_x, grow_y = nw - ow, nh - oh
+        dx = int(round(fx * grow_x))
+        dy = int(round(fy * grow_y))
+        left, top = max(0, dx), max(0, dy)
+        right = max(0, grow_x - dx)
+        bottom = max(0, grow_y - dy)
+
+        sel = self.doc.selection.float_mask() if self.doc.selection is not None else None
+
+        if fill == "内容感知" and (left or top or right or bottom):
+            for layer in list(self.doc.all_layers()):
+                if layer.is_group or layer.image is None:
+                    continue
+                self.doc.detach_pixels(layer)
+                h, w = layer.image.shape[:2]
+                layer.image = extend_canvas_content_aware(
+                    layer.image, sel, left, top, right, bottom,
+                    mode=mode, axis="水平")
+                # **tx/ty 是「源图中心在画布里的位置」，不是左上角**
+                # （见 layer.matrix()：tx - a*cx）。所以要跟着新尺寸重算：
+                # 原来 tx = w/2 表示左边贴画布左边，扩完左边就变成 left
+                layer.tx = layer.image.shape[1] / 2.0 + left
+                layer.ty = layer.image.shape[0] / 2.0 + top
+
+        elif fill != "内容感知":
+            col = np.array(color if color is not None else (255, 255, 255),
+                           np.uint8)
+            pad_val = (int(col[0]), int(col[1]), int(col[2]),
+                       0 if fill == "透明" else 255)
+            for layer in list(self.doc.all_layers()):
+                if layer.is_group or layer.image is None:
+                    continue
+                self.doc.detach_pixels(layer)
+                h, w = layer.image.shape[:2]
+                # **tx/ty 是源图中心在画布里的位置，不是左上角**
+                # （见 layer.matrix()：tx - a*cx，cx = w/2）。
+                # 所以画布往左扩 left 个像素 = 位图整体右移 left，
+                # 位图本身要**左侧补 left 列**。补完再裁掉落到画布外的部分。
+                lx0 = int(round(layer.tx - w / 2.0)) + left
+                ly0 = int(round(layer.ty - h / 2.0)) + top
+                pl = max(0, -lx0)          # 左侧要补多少列
+                pt = max(0, -ly0)
+                pr = max(0, lx0 + w - nw)  # 右侧溢出多少就裁/补多少
+                pb = max(0, ly0 + h - nh)
+                # 溢出量也可能是负的（图层比新画布小）——那就补边
+                pw = max(pr, 0) + max(0, nw - (lx0 + max(w, 0))) - pl
+                ph = max(pb, 0) + max(0, nh - (ly0 + max(h, 0))) - pt
+                if pl or pt or pw > 0 or ph > 0:
+                    layer.image = cv2.copyMakeBorder(
+                        layer.image, pt, max(0, ph), pl, max(0, pw),
+                        cv2.BORDER_CONSTANT, value=pad_val)
+                # 裁掉落在新画布外的部分（画布变小的情况）
+                nh_, nw_ = layer.image.shape[:2]
+                cx0 = max(0, -lx0)
+                cy0 = max(0, -ly0)
+                cx1 = int(max(cx0, min(nw_, nw - lx0)))
+                cy1 = int(max(cy0, min(nh_, nh - ly0)))
+                if cx1 <= cx0 or cy1 <= cy0:
+                    continue        # 整层都在画布外，交给图层变换自己处理
+                if (cx0, cy0, cx1, cy1) != (0, 0, nw_, nh_):
+                    layer.image = layer.image[cy0:cy1, cx0:cx1].copy()
+                # 新的左上角在画布里的位置 -> 换算回中心
+                ox = lx0 + cx0
+                oy = ly0 + cy0
+                layer.tx = ox + layer.image.shape[1] / 2.0
+                layer.ty = oy + layer.image.shape[0] / 2.0
+
+        self.doc.resize(nw, nh)
 
 
 class SmartObjectEditor(MainWindow):

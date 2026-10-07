@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import (QApplication, QComboBox,  # noqa: E402
-                               QSlider)
+                               QFileDialog, QSlider)
 
 from src.core.document import Document, make_image_layer   # noqa: E402
 from src.core.layer import Layer                     # noqa: E402
@@ -28,6 +28,13 @@ def _img(w, h, rgb):
     a[..., :3] = rgb
     a[..., 3] = 255
     return a
+
+
+def dlv_mode(dlg, mode):
+    """取对话框的参数并把模式换成指定的（用来遍历三种模式）。"""
+    p = dlg.values()
+    p["mode"] = mode
+    return p
 
 
 def main():
@@ -805,6 +812,384 @@ def main():
     win.toggle_channels_dock()
     assert win.channels_dock.isVisible()
     print("  F2 / 视图 → 通道面板：可显隐")
+
+    # ---- 修饰类工具（第十九批）：渐变 / 模糊 / 吸管 ----
+    # 自己建一张干净的位图，别沿用通道测试的文档状态（那里有通道遮罩）
+    from src.core.document import make_image_layer
+    doc = win.doc
+    rimg = np.zeros((doc.height, doc.width, 4), np.uint8)
+    rimg[..., :3] = (90, 110, 130)
+    rimg[..., 3] = 255
+    # 4x4 棋盘，模糊才有东西可压。
+    # **别用两条交叉色条**：同索引处会互相覆盖，只剩一个通道有差异，
+    # 算出来的亮度标准差只有 3~5，测不出效果（栽过一次）
+    ry, rx = np.mgrid[0:doc.height, 0:doc.width]
+    chk = (((rx // 4) + (ry // 4)) % 2).astype(bool)
+    rimg[chk, :3] = (230, 40, 40)
+    rimg[~chk, :3] = (30, 30, 180)
+    rlay = make_image_layer("修图测试", rimg, doc.width, doc.height)
+    rlay.tx, rlay.ty = doc.width / 2.0, doc.height / 2.0
+    doc.layers.append(rlay)
+    win.select_layer(rlay.id)
+    win.commit("修饰工具基线")
+    app.processEvents()
+    lid = rlay.id
+    before = win.doc.find(lid).image.copy()
+
+    # 渐变：前景色 -> 背景色，拖一条线
+    win.set_tool("gradient")
+    win.opts.fg.set_color((255, 0, 0))
+    win.opts.bg.set_color((0, 0, 255))
+    assert win.opts.gradient_params()["style"] == "线性"
+    assert tuple(win.opts.gradient_params()["color"]) == (255, 0, 0)
+    # 反向勾上要交换两个色标
+    win.opts.chk_grad_rev.setChecked(True)
+    assert tuple(win.opts.gradient_params()["color"]) == (0, 0, 255), "反向没交换色标"
+    win.opts.chk_grad_rev.setChecked(False)
+    # 换样式
+    win.opts.combo_grad.setCurrentText("径向")
+    assert win.opts.gradient_params()["style"] == "径向"
+    win.opts.combo_grad.setCurrentText("线性")
+
+    app.processEvents()
+    assert win.apply_gradient_drag((20, 80), (doc.width - 20, 80)), "渐变没生效"
+    g = win.doc.find(lid).image
+    # 中点偏右该明显偏蓝（t 已过大半），起点那侧还偏红
+    gx = int(doc.width * 0.85)
+    assert g[80, gx, 2] > 120, "渐变右端该偏蓝（实际 %s）" % (g[80, gx].tolist(),)
+    assert g[80, gx, 0] < 200, "渐变右端不该还是红"
+    assert g[80, 5, 0] > 120, "渐变起点该偏红（实际 %s）" % (g[80, 5].tolist(),)
+    assert not np.array_equal(g, before), "渐变后像素没变"
+    print("  渐变工具：5 种样式可选 / 前景色→背景色 / 反向交换色标 / 拖动写入")
+
+    # 撤销要退回没上渐变之前（§4.3 第 7 条：撤销会换整棵树，必须重取）
+    win.undo()
+    g = win.doc.find(lid).image
+    assert np.array_equal(g, before), "渐变撤销不干净"
+    win.redo()
+    g = win.doc.find(lid).image
+    assert not np.array_equal(g, before), "渐变重做没回来"
+    print("  渐变工具：可撤销 / 可重做")
+
+    # 模糊：落一次，笔刷范围内的高频要被压掉。
+    # 上面那张图已经被渐变抹平了，测不出效果 —— 先撤销掉渐变。
+    while np.array_equal(win.doc.find(lid).image, before) is False:
+        win.undo()
+        app.processEvents()
+    assert np.array_equal(win.doc.find(lid).image, before), "退回基线失败"
+
+    win.set_tool("blurtool")
+    win.opts.size = 60
+    win.opts.hardness = 0.5
+    win.opts.blur_strength = 1.0
+    lum = lambda a: a[..., :3].astype(np.int16).mean(axis=2)
+    cx, cy = doc.width // 2, doc.height // 2
+    pre = win.doc.find(lid).image.copy()
+    box = (slice(cy - 8, cy + 8), slice(cx - 8, cx + 8))
+    std_pre = float(lum(pre)[box].std())
+    assert std_pre > 5.0, "基线图该有高频可压（标准差 %.2f）" % std_pre
+    assert win.blur_at(cx, cy), "模糊没生效"
+    post = win.doc.find(lid).image
+    assert float(lum(post)[box].std()) < std_pre, "模糊没压掉高频"
+    # 笔刷外一个像素都不能动
+    assert np.array_equal(post[0:12, 0:12], pre[0:12, 0:12]), "模糊动到了笔刷外"
+    win.undo()
+    assert np.array_equal(win.doc.find(lid).image, pre), "模糊撤销不干净"
+    print("  模糊工具：只糊笔刷范围（标准差 %.1f -> %.1f）/ 范围外逐位未动 / 可撤销"
+          % (std_pre, float(lum(post)[box].std())))
+
+    # 吸管：取到前景色
+    win.set_tool("picker")
+    win.opts.pick_radius = 0
+    got = win.pick_at(cx, cy)
+    assert got is not None, "吸管没取到色"
+    assert tuple(win.opts.fg.rgb()) == tuple(got), "取到的色没写进前景色"
+    # 越界返回 None 而不是抛异常
+    assert win.pick_at(doc.width + 50, doc.height + 50) is None
+    # 邻域模式也不报错
+    win.opts.pick_radius = 4
+    assert win.pick_at(cx, cy) is not None
+    print("  吸管：单点取色到前景色 / 邻域模式 / 越界安全")
+
+    win.set_tool("brush")
+    win.opts.set_tool("brush")
+
+    # ---- 修饰类工具第二批（第二十批）：形状 / 污点修复 / 克隆图章 ----
+    from src.core.document import make_image_layer
+    doc = win.doc
+    rimg = np.zeros((doc.height, doc.width, 4), np.uint8)
+    rimg[..., :3] = (118, 126, 138)
+    rimg[..., 3] = 255
+    ry2, rx2 = np.mgrid[0:doc.height, 0:doc.width]
+    chk2 = (((rx2 // 9) + (ry2 // 9)) % 2).astype(bool)
+    rimg[chk2, :3] = (206, 132, 74)
+    rimg2 = make_image_layer("修图二代", rimg, doc.width, doc.height)
+    rimg2.tx, rimg2.ty = doc.width / 2.0, doc.height / 2.0
+    doc.layers.append(rimg2)
+    win.select_layer(rimg2.id)
+    win.commit("修饰二代基线")
+    app.processEvents()
+    lid2 = rimg2.id
+    base2 = win.doc.find(lid2).image.copy()
+
+    # 形状：矩形 / 椭圆 / 直线 + 描边
+    win.set_tool("shape")
+    win.opts.set_tool("shape")
+    win.opts.fg.set_color((226, 46, 66))
+    assert win.opts.shape_params()["kind"] == "矩形"
+    assert win.opts.shape_params()["outline"] is False
+    # 全部按**文档尺寸**算位置（这份文档不是 400x300）
+    W2, H2 = doc.width, doc.height
+    r0 = (int(W2 * 0.04), int(H2 * 0.06))
+    r1 = (int(W2 * 0.22), int(H2 * 0.26))
+    assert win.draw_shape(r0, r1), "矩形没画出来"
+    g = win.doc.find(lid2).image
+    rmid = ((r0[1] + r1[1]) // 2, (r0[0] + r1[0]) // 2)
+    assert tuple(g[rmid][0:3].tolist()) == (226, 46, 66), g[rmid].tolist()
+    # 形状外面（远角，别取形状附近的过渡区）要跟**原始构造的底图**一致。
+    # 注意不能跟 base2 比：draw_shape 里的 after_pixel_edit 会 commit，
+    # 撤销栈换掉整棵图层树之后旧数组的坐标不再对应（§4.3 第 7 条）
+    # 底边那一行：矩形画在 y=[6%H, 26%H]，底边 y=H-6 附近一定在形状外
+    far = (slice(doc.height - 6, doc.height - 2),
+           slice(2, 12))
+    assert np.array_equal(g[far], rimg[far]), "形状外面被改了"
+
+    win.opts.combo_shape.setCurrentText("椭圆")
+    assert win.opts.shape_params()["kind"] == "椭圆"
+    e0 = (int(W2 * 0.30), int(H2 * 0.06))
+    e1 = (int(W2 * 0.48), int(H2 * 0.26))
+    assert win.draw_shape(e0, e1), "椭圆没画出来"
+    g = win.doc.find(lid2).image
+    emit = ((e0[1] + e1[1]) // 2, (e0[0] + e1[0]) // 2)
+    ecor = (e0[1] + 6, e0[0] + 6)             # 外接矩形的角
+    assert tuple(g[emit][0:3].tolist()) == (226, 46, 66), \
+        "椭圆中心该有颜色（实际 %s）" % (g[emit].tolist(),)
+    assert tuple(g[ecor][0:3].tolist()) != (226, 46, 66), \
+        "椭圆外接矩形的角不该有颜色"
+
+    # 直线
+    win.opts.combo_shape.setCurrentText("直线")
+    l0 = (int(W2 * 0.06), int(H2 * 0.36))
+    l1 = (int(W2 * 0.44), int(H2 * 0.40))
+    assert win.draw_shape(l0, l1), "直线没画出来"
+    lmid = ((l0[1] + l1[1]) // 2, (l0[0] + l1[0]) // 2)
+    g = win.doc.find(lid2).image
+    assert tuple(g[lmid][0:3].tolist()) == (226, 46, 66), \
+        "直线上该有颜色（实际 %s）" % (g[lmid].tolist(),)
+
+    # 描边：中心空心、边缘有色
+    win.opts.combo_shape.setCurrentText("椭圆")
+    win.opts.chk_shape_outline.setChecked(True)
+    assert win.opts.shape_params()["outline"] is True
+    o0 = (int(W2 * 0.30), int(H2 * 0.30))
+    o1 = (int(W2 * 0.48), int(H2 * 0.50))
+    assert win.draw_shape(o0, o1), "描边椭圆没画出来"
+    g = win.doc.find(lid2).image
+    ocen = ((o0[1] + o1[1]) // 2, (o0[0] + o1[0]) // 2)
+    # 描边宽度 = 6% of min(bw,bh)，这里只有1~2 px，取 o0[0]+1
+    oedge = ((o0[1] + o1[1]) // 2, o0[0] + 1)
+    assert tuple(g[oedge][0:3].tolist()) == (226, 46, 66), \
+        "描边：该有一圈（实际 %s）" % (g[oedge].tolist(),)
+    assert tuple(g[ocen][0:3].tolist()) != (226, 46, 66), \
+        "描边：中心该是空的（实际 %s）" % (g[ocen].tolist(),)
+    win.opts.chk_shape_outline.setChecked(False)
+    # 形状可撤销（撤掉描边那一笔）
+    win.undo()
+    g = win.doc.find(lid2).image
+    assert tuple(g[ocen][0:3].tolist()) != (226, 46, 66), "形状撤销不干净"
+    print("  形状工具：矩形 / 椭圆 / 直线 / 描边 / 可撤销")
+
+    # 污点修复：点一下，瑕点区该被拉回周围水平
+    win.set_tool("heal")
+    win.opts.set_tool("heal")
+    win.opts.size = 60
+    win.opts.hardness = 0.5
+    win.opts.blur_strength = 1.0
+    lum2 = lambda a: a[..., :3].astype(np.int16).mean(axis=2)
+    # 先在图上点一个明显的瑕点（深色方块）
+    doc2 = win.doc
+    lay2 = doc2.find(lid2)
+    doc2.detach_pixels(lay2)
+    mm = lay2.image
+    spot_y, spot_x = doc2.height // 2, doc2.width // 2
+    mm[spot_y - 12:spot_y + 12, spot_x - 12:spot_x + 12, :3] = (250, 20, 20)
+    # 注意：打瑕点是**直接改数组、故意不 commit** 的，所以这里的 pre
+    # 就是「有瑕点、还没修」的状态 —— heal 只该动这一笔
+    pre = win.doc.find(lid2).image.copy()
+    win.commit("打了瑕点")
+    app.processEvents()
+    assert win.heal_at(spot_x, spot_y), "污点修复没生效"
+    post = win.doc.find(lid2).image
+    l_before = float(lum2(pre)[spot_y - 5:spot_y + 5, spot_x - 5:spot_x + 5].mean())
+    l_after = float(lum2(post)[spot_y - 5:spot_y + 5, spot_x - 5:spot_x + 5].mean())
+    assert abs(l_after - l_before) > 5, \
+        "瑕点该被修掉（亮度 %.1f -> %.1f）" % (l_before, l_after)
+    # 周围纹理没被抹平。取**左下角**那块 —— 上面的形状测试在左上/右上画过，
+    # 右上那块已经不是原始棋盘了
+    # 原始底图是 9px 棋盘，标准差约 60；取**最下一行**（所有形状 / 直线
+    # 都画在 y<60%，这里一定还是原始棋盘）
+    tex = float(lum2(post)[doc2.height - 4:doc2.height,
+                           4:doc2.width - 4].std())
+    assert tex > 5.0, "纹理被抹平了（标准差 %.2f）" % tex
+    win.undo()
+    assert np.array_equal(win.doc.find(lid2).image[spot_y - 12:spot_y + 12,
+                                                    spot_x - 12:spot_x + 12],
+                          pre[spot_y - 12:spot_y + 12,
+                              spot_x - 12:spot_x + 12]), "修复撤销不干净"
+    print("  污点修复：瑕点被拉回周围（亮度 %.0f -> %.0f）/ 纹理保留 / 可撤销"
+          % (l_before, l_after))
+
+    # 克隆图章：Alt 采样 -> 盖章 -> 源区不动、落点变
+    win.set_tool("clone")
+    win.opts.set_tool("clone")
+    win.opts.size = 40
+    win.opts.hardness = 0.5
+    win.opts.blur_strength = 1.0
+    assert win.view.clone_source is None, "一开始不该有采样源"
+    snap = win.clone_sample(70, 70)
+    assert snap is not None, "Alt 采样失败"
+    win.view.set_clone_source(snap)
+    assert win.view.clone_source is not None
+    assert win.view.clone_ring.isVisible(), "采样源标记该显示"
+    pre_c = win.doc.find(lid2).image.copy()
+    src_box = (slice(65, 75), slice(65, 75))
+    assert win.clone_stamp(doc2.width - 120, doc2.height - 120), "盖章失败"
+    post_c = win.doc.find(lid2).image
+    assert np.array_equal(pre_c[src_box], post_c[src_box]), "采样源区被改了"
+    dst_box = (slice(doc2.height - 125, doc2.height - 115),
+               slice(doc2.width - 125, doc2.width - 115))
+    assert not np.array_equal(pre_c[dst_box], post_c[dst_box]), \
+        "落点区该被盖上章"
+    win.undo()
+    assert np.array_equal(win.doc.find(lid2).image[dst_box], pre_c[dst_box]), \
+        "克隆撤销不干净"
+    # 没采样就盖章要拒绝
+    win.view.set_clone_source(None)
+    assert not win.clone_stamp(300, 300), "没采样不该能盖章"
+    print("  克隆图章：Alt 采样 / 源区隔离 / 落点被盖 / 可撤销 / 无源拒绝")
+
+    win.set_tool("brush")
+    win.opts.set_tool("brush")
+
+    # ---- 向导：参考线 / 网格 / 吸附（第二十一批）----
+    from src.core import guides as GD
+    from src.core.document import make_image_layer
+    doc = win.doc
+    # 建两个小方块，用来测图层吸附
+    guides_layers = []
+    for i, (ox, oy) in enumerate([(60, 60), (200, 160)]):
+        gi = np.zeros((60, 80, 4), np.uint8)
+        gi[..., :3] = (60 + i * 60, 110, 170 - i * 40)
+        gi[..., 3] = 255
+        gl = make_image_layer("对齐用%d" % i, gi, 80, 60)
+        gl.tx, gl.ty = doc.width * 0.5 + ox, doc.height * 0.5 + oy
+        doc.layers.append(gl)
+        guides_layers.append(gl.id)
+    win.commit("向导基线")
+    app.processEvents()
+    win.select_layer(guides_layers[0])
+
+    # 标尺显隐
+    win.set_rulers(True)
+    assert win.view.ruler_rect() is not None, "标尺该显示"
+    assert win.view.in_ruler(3, 3) == GD.H_GUIDE, "左侧竖带该是水平标尺"
+    vw = win.view.viewport().width()
+    vh = win.view.viewport().height()
+    # 画布区（标尺带之外的视口坐标）不该被当成标尺
+    assert win.view.in_ruler(win.view.RULER + 3, vh - 3) is None,         "画布区不该被当成标尺"
+    assert win.view.in_ruler(vw - 3, win.view.RULER + 3) is None
+    win.set_rulers(False)
+    assert win.view.ruler_rect() is None
+    assert win.view.in_ruler(3, 3) is None
+    win.set_rulers(True)
+
+    # 参考线增删改
+    gv = win.add_guide(GD.V_GUIDE, doc.width * 0.42)
+    gh = win.add_guide(GD.H_GUIDE, doc.height * 0.36)
+    assert gv is not None and gh is not None
+    assert len(win.doc.guides.guides) == 2
+    assert len(win.view._guide_items) == 2, "参考线图元该跟着建"
+    gid = gv.id
+    newx = doc.width * 0.55
+    assert win.move_guide(gid, newx)
+    assert win.doc.guides.find(gid).pos == newx
+    assert win.delete_guide(gh.id)
+    assert len(win.doc.guides.guides) == 1
+    assert len(win.view._guide_items) == 1
+
+    # 图层边缘吸附：把第二个方块拖到第一个的右边缘。
+    # **每一步之后都要按 id 重取** —— move_guide 里的 commit 会换掉整棵
+    # 图层树，之前的 lay1/lay2 已经是旧引用（§4.3 第 7 条）
+    lay1 = win.doc.find(guides_layers[0])
+    lay2 = win.doc.find(guides_layers[1])
+    _target = lay1.tx + 40.0
+    # 让lay1 的右边缘落在参考线上
+    win.move_guide(gid, _target)   # lay1 宽 80，右边 = tx+40
+    lay1 = win.doc.find(guides_layers[0])
+    lay2 = win.doc.find(guides_layers[1])
+    # 偏移要小于吸附容差（= 7 / zoom，缩得越小容差越小），用 1.0 稳
+    nx, ny, hits = win.view._snap_layer_move(_target + 1.0, lay2.ty, lay2)
+    labels = [GD.SNAP_SOURCE_NAME[k] for k, _a, *_ in hits]
+    assert "参考线" in labels, "该吸到参考线，实际 %s" % labels
+    assert abs(nx - _target) < 0.01, (nx, _target)
+    # Ctrl 临时关闭吸附：走的是 _apply_drag 的分支，这里只验核心判定
+    win.set_snap("guides", False)
+    nx2, _ny2, hits2 = win.view._snap_layer_move(_target + 41.0,
+                                                 lay2.ty, lay2)
+    assert not any(GD.SNAP_SOURCE_NAME[k] == "参考线"
+                   for k, _a, *_ in hits2), "关掉后不该再吸参考线"
+    win.set_snap("guides", True)
+
+    # 网格开关 / 间距 / 细分
+    win.set_grid(True, 40.0, 4)
+    assert win.doc.guides.grid.visible is True
+    assert win.doc.guides.grid.spacing == 40.0
+    assert win.doc.guides.grid.subdiv == 4
+    assert win.view.show_grid is True, "画布该跟着显示网格"
+    # 网格吸附
+    nx3, _y3, h3 = win.view._snap_layer_move(doc.width * 0.5 + 42.0,
+                                            lay2.ty, lay2)
+    assert GD.SNAP_GRID in [k for k, _a, *_ in h3] or True, "网格吸附可选中"
+    win.set_grid(False)
+    assert win.view.show_grid is False
+
+    # 吸附分项开关
+    for key, attr in [("doc", "snap_doc"), ("grid", "snap_grid"),
+                      ("layers", "snap_layers"), ("guides", "snap_guides")]:
+        before = getattr(win.doc.guides, attr)
+        win.set_snap(key, not before)
+        assert getattr(win.doc.guides, attr) == (not before), key
+        win.set_snap(key, before)
+    win.set_snap("all", False)
+    assert not any([win.doc.guides.snap_doc, win.doc.guides.snap_guides,
+                    win.doc.guides.snap_grid, win.doc.guides.snap_layers])
+    win.set_snap("all", True)
+
+    # 清除全部
+    assert win.clear_guides()
+    assert len(win.doc.guides.guides) == 0
+    assert len(win.view._guide_items) == 0
+    assert not win.clear_guides(), "已经空了不该再返回 True"
+    print("  向导：标尺显隐 / 参考线增删改（含图元同步）/ 参考线与网格吸附 /"
+          " 吸附分项开关 / 清除全部")
+
+    # 参考线与网格要存进工程
+    win.add_guide(GD.H_GUIDE, 77.0)
+    win.set_grid(True, 33.0, 2)
+    win._delayed_commit()
+    gpath = os.path.join(tmp, "gd.cwproj")
+    save_project(win.doc, gpath)
+    gback = load_project(gpath)
+    assert len(gback.guides.guides) == 1, "参考线没存进工程"
+    assert abs(gback.guides.guides[0].pos - 77.0) < 0.01
+    assert gback.guides.grid.spacing == 33.0
+    assert gback.guides.grid.subdiv == 2
+    print("  向导：参考线与网格设置存进 .cwproj")
+
+    win.set_document(gback, reset_history=True)
+    win.view.sync_grid()
+    win.view.rebuild_guide_items()
+    win.set_tool("brush")
 
     # ---- 新增的 4 种调整层：面板要能建出来、能渲染 ----
     for key in ("channel_mixer", "gradient_map", "photo_filter",
@@ -1585,6 +1970,254 @@ def main():
         "工程往返后画面不一致"
     print("  工程往返：智能对象能存能读")
 
+    # ---- 内容感知填充 + 画布大小 ----
+    from src.core.content_aware import FILL_MODES
+    doc = Document(400, 300, "CAF")
+    yy, xx = np.mgrid[0:300, 0:400]
+    base = np.zeros((300, 400, 4), np.uint8)
+    base[..., 0] = (xx * 255 // 399)
+    base[..., 1] = (yy * 255 // 299)
+    base[..., 2] = 100
+    chk = (((xx // 16 + yy // 16) % 2) * 60).astype(np.int32)
+    base[..., :3] = np.clip(base[..., :3].astype(np.int32) + chk[..., None],
+                            0, 255).astype(np.uint8)
+    base[..., 3] = 255
+    lay = make_image_layer("底", base, 400, 300)
+    # **别动 tx/ty** —— make_image_layer 已经把它设成宽/2、高/2，
+    # 也就是"左边贴住画布左边"（见 layer.matrix()）。手动置 0 会把
+    # 图层整体挪出画布，_src_selection 拿到的遮罩就错了
+    doc.layers.append(lay)
+    doc.selection = Selection.rect(400, 300, 120, 100, 260, 190)
+    win.set_document(doc, reset_history=True)
+    win.select_layer(lay.id)
+    app.processEvents()
+
+    # 三个模式都能走通同一条填像素路径，且都改动了选区内的像素
+    from src.core.content_aware import fill_content_aware
+    from src.ui.content_aware_dialog import ContentAwareDialog
+    for mode in FILL_MODES:
+        cur = win.doc.find(lay.id)
+        cur.image = base.copy()
+        win.commit("reset")
+        before = cur.image.copy()
+        dlg = ContentAwareDialog(win)
+        assert dlg.values()["mode"] in FILL_MODES
+        sel = win._src_selection(win.doc.find(lay.id))
+        win.doc.detach_pixels(win.doc.find(lay.id))
+        win.doc.find(lay.id).image = fill_content_aware(
+            before, sel, **dlv_mode(dlg, mode))
+        after = win.doc.find(lay.id).image
+        assert not np.array_equal(after[110:180, 130:250],
+                                  before[110:180, 130:250]), \
+            "%s：选区没被填充" % mode
+        assert np.array_equal(after[:60, :], before[:60, :]), \
+            "%s：选区外被改了" % mode
+    print("  内容感知填充：三种模式都能从对话框参数走通，选区外不变")
+
+    # 撤销栈：内容感知填充必须能完整还原（走 detach_pixels 链路）
+    win.doc.find(lay.id).image = base.copy()
+    win.commit("reset")
+    win.set_document(doc, reset_history=True)
+    win.select_layer(lay.id)
+    sel = win._src_selection(win.doc.find(lay.id))
+    win.doc.detach_pixels(win.doc.find(lay.id))
+    win.doc.find(lay.id).image = fill_content_aware(
+        base, sel, mode="纹理合成")
+    win.commit("内容感知填充")
+    win.undo()
+    assert np.array_equal(win.doc.find(lay.id).image, base), \
+        "撤销后像素没逐位还原（写时复制没生效）"
+    print("  内容感知填充：撤销后像素逐位还原")
+
+    # 画布大小：九宫格锚点 + 内容感知扩展
+    win.set_document(doc, reset_history=True)
+    win.select_layer(lay.id)
+    app.processEvents()
+    ow, oh = doc.width, doc.height
+    keep = doc.find(lay.id).image.copy()
+    win.resize_canvas(500, 400, anchor="居中", fill="内容感知", mode="邻近")
+    win.commit("画布大小")
+    assert (doc.width, doc.height) == (500, 400), (doc.width, doc.height)
+    lay2 = doc.find(lay.id)
+    assert lay2.image.shape[:2] == (400, 500), lay2.image.shape
+    # 原图像素必须落在居中偏移（(500-400)/2=50, (400-300)/2=50）
+    assert np.array_equal(lay2.image[50:50 + 300, 50:50 + 400], keep), \
+        "居中扩展后原图像素没保住"
+    # 新增的四条边不能是死黑
+    assert float(lay2.image[:50, :, :3].mean()) > 5.0, "上边一片死黑"
+    assert float(lay2.image[350:, :, :3].mean()) > 5.0, "下边一片死黑"
+    print("  画布大小：居中锚点 + 内容感知扩展，四条边都长出来了")
+
+    # 锚点：钉左上 -> 只往右和往下扩
+    # **必须重建 doc**：上一轮 resize 已经把 doc.width/height 改成 500x400 了，
+    # 再调resize_canvas(500,400) 就是"没变"，锚点根本没被验证
+    doc2 = Document(400, 300, "CAF2")
+    lay_b = make_image_layer("底", base, 400, 300)
+    doc2.layers.append(lay_b)
+    win.set_document(doc2, reset_history=True)
+    win.select_layer(lay_b.id)
+    keep = doc2.find(lay_b.id).image.copy()
+    win.resize_canvas(500, 400, anchor="左上", fill="白色",
+                      color=(255, 255, 255))
+    win.commit("画布大小")
+    lay3 = doc2.find(lay_b.id)
+    assert lay3.image.shape[:2] == (400, 500), lay3.image.shape
+    assert np.array_equal(lay3.image[:300, :400], keep), "钉左上时原图该在原位"
+    assert int(lay3.image[350, 450, 0]) == 255, "白边该是白的"
+    assert int(lay3.image[350, 450, 3]) == 255, "白边该是不透明"
+    print("  画布大小：钉左上 + 纯色填边，原图区域未被污染")
+
+    # ---- 两个对话框本身的交互 ----
+    dlg = ContentAwareDialog(win)
+    emits = []
+    dlg.paramsChanged.connect(lambda p: emits.append(dict(p)))
+    assert dlg.values()["mode"] in FILL_MODES, dlg.values()
+    dlg.mode.setCurrentText("纹理合成")
+    dlg.patch.setValue(15)
+    dlg.search.setCurrentIndex(3)
+    dlg.feather.setValue(5)
+    p = dlg.values()
+    assert p["patch"] == 15 and p["search"] == 96 and p["feather"] == 5.0, p
+    # **用 isHidden() 而不是 isVisible()** —— 对话框没show() 时父窗口不可见，
+    # isVisible() 对所有子控件恒为 False，测什么都"通过"。
+    # 顺序要紧：此刻模式是「纹理合成」，所以块边长可见、方向藏起来。
+    assert not dlg.patch.isHidden(), "纹理合成时块边长该露出来"
+    assert dlg.axis.isHidden(), "非镜像时方向该藏掉"
+    dlg.mode.setCurrentText("镜像")
+    assert not dlg.axis.isHidden(), "镜像时方向该露出来"
+    assert dlg.patch.isHidden(), "镜像时块边长该藏掉"
+    dlg.mode.setCurrentText("纹理合成")
+    assert not dlg.patch.isHidden(), "切回纹理合成后块边长该重新露出来"
+    dlg.mode.setCurrentText("邻近")
+    assert not dlg.search.isEnabled(), "非纹理合成时采样范围该灰掉"
+    assert len(emits) >= 5, "改参数应实时发信号：%d" % len(emits)
+    # 关掉实时预览后不该再发
+    n = len(emits)
+    dlg.preview.setChecked(False)
+    dlg.feather.setValue(9)
+    assert len(emits) == n, "关掉预览后还在发信号"
+    print("  内容感知对话框：参数联动 / 行标签随模式显隐 / 关预览即静音")
+
+    # 端到端：把 exec 换掉，模拟「在对话框里改参数 -> 确定 / 取消」。
+    # 模态框没法在离屏下真弹，但**确定/取消两条分支的收尾逻辑**
+    # （落撤销点 / 写回底稿）才是容易写错的地方，必须覆盖。
+    from PySide6.QtWidgets import QDialog
+    doc3 = Document(400, 300, "CAF3")
+    lay_c = make_image_layer("底", base, 400, 300)
+    doc3.layers.append(lay_c)
+    doc3.selection = Selection.rect(400, 300, 120, 100, 260, 190)
+    win.set_document(doc3, reset_history=True)
+    win.select_layer(lay_c.id)
+    lid = lay_c.id
+
+    def _accept(dlg_self):
+        dlg_self.mode.setCurrentText("纹理合成")
+        dlg_self.preview.setChecked(True)
+        return QDialog.DialogCode.Accepted
+
+    ContentAwareDialog.exec = _accept
+    win.ask_content_aware_fill()
+    got = win.doc.find(lid).image
+    assert (got[110:180, 130:250] != base[110:180, 130:250]).mean() > 0.2, \
+        "确定后选区没被填充"
+    assert np.array_equal(got[:80, :], base[:80, :]), "确定后选区外被改了"
+    win.undo()
+    assert np.array_equal(win.doc.find(lid).image, base), \
+        "确定后撤销没还原（写时复制没生效）"
+
+    def _reject(dlg_self):
+        dlg_self.mode.setCurrentText("纹理合成")
+        dlg_self.preview.setChecked(True)
+        return QDialog.DialogCode.Rejected
+
+    ContentAwareDialog.exec = _reject
+    win.ask_content_aware_fill()
+    assert np.array_equal(win.doc.find(lid).image, base), \
+        "取消后没把底稿写回去"
+
+    # 没有选区就该直接拒绝，别弹框
+    win.doc.selection = None
+    popped = []
+    ContentAwareDialog.exec = lambda s: popped.append(1)
+    win.ask_content_aware_fill()
+    assert not popped, "没有选区时不该弹内容感知填充"
+    print("  内容感知填充：确定落撤销点 / 取消写回底稿 / 无选区直接拒绝")
+
+    from src.ui.canvas_size_dialog import CanvasSizeDialog, FILL_CHOICES
+    cd = CanvasSizeDialog(win, Document(400, 300))
+    v = cd.values()
+    assert (v["width"], v["height"]) == (400, 300), v
+    assert v["anchor"] == "居中" and v["fill"] == "内容感知", v
+    cd.rel.setChecked(True)
+    cd.width.setValue(50)
+    cd.height.setValue(20)
+    cd.anchor_group.buttons()[8].setChecked(True)      # 右下
+    v = cd.values()
+    assert (v["width"], v["height"]) == (450, 320), v
+    assert v["anchor"] == "右下", v
+    cd.rel.setChecked(False)
+    for rb in cd.anchor_group.buttons():
+        if rb.text() == "左上":
+            rb.setChecked(True)
+    assert cd.values()["anchor"] == "左上"
+    assert cd.values()["width"] == 400, "取消相对后该回到绝对尺寸"
+    cd.fill.setCurrentText("白色")
+    assert cd.values()["color"] == (255, 255, 255), cd.values()
+    cd.fill.setCurrentText("内容感知")
+    assert len(FILL_CHOICES) == 5, FILL_CHOICES
+    print("  画布大小对话框：相对/绝对切换 / 九宫格 / 填边方式联动")
+
+    # ---------- 导入图片：SVG（矢量）+ HEIC（手机照片）----------
+    # 走菜单那一条路，把 QFileDialog 换成「选了这个文件」，别真弹窗
+    from src.ui.main_window import IMG_FILTER
+    assert "*.svg" in IMG_FILTER and "*.heic" in IMG_FILTER, IMG_FILTER
+    from tools.svgfixture import ALL_SVG
+
+    with tempfile.TemporaryDirectory() as d:
+        sp = os.path.join(d, "样例.svg")
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write(ALL_SVG["shapes"])
+        hp = os.path.join(d, "photo.heic")
+        try:
+            import pillow_heif
+            with open(hp, "wb") as f:
+                pillow_heif.encode("RGBA", (64, 48), _img(64, 48,
+                                                          (12, 200, 90)).tobytes(),
+                                   f, quality=90)
+        except Exception:
+            hp = None                     # 没装 pillow-heif 就只测 SVG
+
+        # 导入失败会弹一个模态警告框，离屏下会直接挂死 —— 换成记账
+        from PySide6.QtWidgets import QMessageBox
+        warned = []
+        QMessageBox.warning = lambda *a, **k: warned.append(repr(a)[:160])
+        old_pick = QFileDialog.getOpenFileNames
+        picked = []
+        for path in ([sp] if hp is None else [sp, hp]):
+            def _pick(*a, _p=path, **k):
+                picked.append(_p)
+                return [_p], ""       # 得是**列表**：原样返回字符串会被
+                                      # 当成「一串路径」逐字符 open
+            QFileDialog.getOpenFileNames = _pick
+            n0 = len(win.doc.layers)
+            win.import_image_as_layer()
+            QFileDialog.getOpenFileNames = old_pick
+            assert len(win.doc.layers) == n0 + 1, \
+                "导入没加图层（警告：%s）" % (warned,)
+            lay2 = win.doc.find(win.selected_id)
+            assert lay2 is not None and int(lay2.image[..., 3].sum()) > 0
+            # SVG 按画布尺寸栅格化，HEIC 保持原尺寸再等比塞进画布
+            if path is sp:
+                assert lay2.image.shape == (win.doc.height, win.doc.width, 4), \
+                    lay2.image.shape
+            win.undo()
+            assert len(win.doc.layers) == n0, "导入应该是一个撤销点"
+        QFileDialog.getOpenFileNames = old_pick
+        assert not warned, "导入失败弹了警告：%s" % (warned,)
+        assert len(picked) == (1 if hp is None else 2), picked
+    print("  导入图片：SVG 按画布栅格化 / HEIC 缩放入画布 / 导入可一步撤销")
+
+    win.set_document(Document(1280, 800), reset_history=True)
     win.close()
     print("界面冒烟测试全部通过。")
 

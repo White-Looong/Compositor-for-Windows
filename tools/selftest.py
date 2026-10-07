@@ -1226,6 +1226,635 @@ def test_psd_effects():
     print("  导入的样式参与渲染：与无样式版有差异（最大差 %d）" % diff.max())
 
 
+def test_retouch():
+    """修饰类工具：渐变 / 局部模糊 / 吸管（core/retouch.py，第十九批）。"""
+    from src.core import retouch as rt
+
+    # ---------- 渐变：5 种样式 ----------
+    for style in rt.GRADIENT_STYLES:
+        t = rt.gradient_t((40, 40), (20, 20), (39, 0), style)
+        assert t.shape == (40, 40), style
+        assert 0.0 <= float(t.min()) and float(t.max()) <= 1.0, style
+        assert not np.isnan(t).any(), "%s 出了 nan" % style
+    # 圆心样式的 t 在起点是 0（起点就是圆心）
+    for style in ("径向", "菱形"):
+        t = rt.gradient_t((40, 40), (20, 20), (39, 0), style)
+        assert t[20, 20] < 0.02, "%s 起点 t=%f" % (style, t[20, 20])
+    # 线性：起点 0、终点 1
+    lin = rt.gradient_t((41, 41), (0, 20), (40, 20), "线性")
+    assert lin[20, 0] < 0.02 and lin[20, 40] > 0.98, (lin[20, 0], lin[20, 40])
+    # 对称：两端都是 1、中线折返到 0（PS 的对称渐变就是这样镜像的）
+    sym = rt.gradient_t((41, 41), (0, 20), (40, 20), "对称")
+    assert sym[20, 0] > 0.98 and sym[20, 20] < 0.02, (sym[20, 0], sym[20, 20])
+    assert sym[20, 40] > 0.98, sym[20, 40]
+    # 退化：起终点重合不许出 nan
+    for style in rt.GRADIENT_STYLES:
+        t = rt.gradient_t((8, 8), (4, 4), (4, 4), style)
+        assert not np.isnan(t).any(), "%s 零长度出 nan" % style
+
+    # ---------- 渐变写进位图 ----------
+    img = np.zeros((40, 40, 4), np.uint8)
+    img[..., 3] = 255
+    rt.apply_gradient(img, (0, 20), (39, 20),
+                      {"style": "线性", "color": [0, 0, 0],
+                       "color2": [255, 255, 255]})
+    assert img[20, 1, 0] < img[20, 38, 0], "线性渐变该从暗到亮"
+    # 投影除法有舍入，末端不是精确 255（实测 248），留 8 的容差
+    assert img[20, 38, 0] >= 247, img[20, 38, 0]
+    assert img[20, 38, 3] == 255, "渐变不该动 alpha"
+    # 选区外完全不写
+    img2 = np.zeros((40, 40, 4), np.uint8)
+    img2[..., 3] = 255
+    sel = np.zeros((40, 40), np.float32)
+    sel[:, 20:] = 1.0
+    rt.apply_gradient(img2, (0, 20), (39, 20),
+                      {"style": "线性", "color": [0, 0, 0],
+                       "color2": [255, 255, 255]}, sel)
+    assert img2[20, 0, 0] == 0, "选区外不该被写"
+    assert img2[20, 39, 0] > 200, "选区内该被写"
+    # 空选区 -> 原样返回
+    img3 = np.zeros((10, 10, 4), np.uint8)
+    before = img3.copy()
+    rt.apply_gradient(img3, (0, 0), (9, 9), {"style": "线性"},
+                      np.zeros((10, 10), np.float32))
+    assert np.array_equal(img3, before), "空选区不该动任何像素"
+
+    # ---------- 羽化权重 ----------
+    w = rt.feathered_disk(21, 0.5)
+    assert w[10, 10] == 1.0, "中心权重必须是 1"
+    assert w[10, 20] == 0.0, "圆外权重必须是 0"
+    w_hard = rt.feathered_disk(21, 1.0)
+    assert w_hard[10, 13] == 1.0, "硬度 100 应该是硬边"
+    w_soft = rt.feathered_disk(21, 0.0)
+    assert 0.0 < w_soft[10, 13] < 1.0, "硬度 0 应该是全羽化"
+    assert w_soft[10, 20] == 0.0, "圆外恒为 0"
+
+    # ---------- 局部模糊：压高频、不动远处、不越界 ----------
+    img = np.zeros((60, 60, 4), np.uint8)
+    img[..., 3] = 255
+    yy, xx = np.mgrid[0:60, 0:60]
+    chk = ((xx // 6 + yy // 6) % 2)
+    img[..., 0] = chk * 255
+    img[..., 1] = chk * 255
+    img[..., 2] = chk * 255
+    orig = img.copy()
+    lum = lambda a: a[..., :3].astype(np.int16).mean(axis=2)
+    std_before = float(lum(img).std())
+    rt.blur_region(img, 30, 30, 12.0, hardness=0.5, strength=1.0)
+    std_after = float(lum(img).std())
+    assert std_after < std_before, "模糊没压掉高频（%.2f -> %.2f）" % (
+        std_before, std_after)
+    # 笔刷外一个像素都不能动
+    assert np.array_equal(img[0:8, 0:8], orig[0:8, 0:8]), "笔刷外被改了"
+    # 边界不越界：角上模糊不能抛异常，也不能改到画布外
+    rt.blur_region(img, 0, 0, 15.0, 0.5, 1.0)
+    rt.blur_region(img, 59, 59, 15.0, 0.5, 1.0)
+    # strength=0 与半径<1 都该是空操作
+    snap = img.copy()
+    rt.blur_region(img, 30, 30, 15.0, 0.5, 0.0)
+    rt.blur_region(img, 30, 30, 0.0, 0.5, 1.0)
+    assert np.array_equal(img, snap), "空模糊改了像素"
+    # 多次涂抹趋于更平（累积）。实测 127.5 -> 55 -> 23 -> 8.4 -> 2.7，
+    # 再涂也降不下去了（uint8 量化的地板，稳定在 5 左右），别把阈值定死 0
+    for _ in range(6):
+        rt.blur_region(img, 30, 30, 10.0, 0.5, 0.6)
+    assert float(lum(img)[26:34, 26:34].std()) < 8.0, "反复涂抹应该糊平"
+    # 透明边的 alpha 也要跟着走，不能留脏边
+    tr = np.zeros((40, 40, 4), np.uint8)
+    tr[..., 3] = 0
+    tr[20:40, 20:40, 3] = 255
+    tr[20:40, 20:40, :3] = (10, 20, 30)
+    rt.blur_region(tr, 20, 20, 8.0, 0.5, 1.0)
+    a = tr[..., 3]
+    assert a.min() == 0, "半透明区外不该被填成不透明"
+    assert a.max() == 255, "实心区的 alpha 不该被削掉"
+
+    # ---------- 吸管 ----------
+    a = np.zeros((20, 20, 4), np.uint8)
+    a[..., :3] = (10, 200, 30)
+    a[..., 3] = 128
+    assert rt.pick_color(a, 5, 5) == (10, 200, 30, 128)
+    assert rt.pick_color(a, 5, 5, radius=3) == (10, 200, 30, 128)
+    assert rt.pick_color(a, 99, 99) is None, "越界该返回 None"
+    assert rt.pick_color(None, 1, 1) is None
+    # 邻域均值确实取到了多样本
+    half = np.zeros((10, 10, 4), np.uint8)
+    half[..., :3] = (0, 0, 0)
+    half[:, 5:, :3] = (200, 200, 200)
+    assert rt.pick_color(half, 4, 5, radius=4)[0] < 200, "邻域该被平均掉"
+    print("  修饰类工具：渐变 5 样式 / 局部模糊（压高频·不越界·透明边干净）"
+          " / 吸管（单点·邻域·越界）都对")
+
+
+def test_retouch2():
+    """修饰类工具第二批：克隆图章 / 污点修复 / 形状（第二十批）。"""
+    import cv2
+    from src.core import retouch as rt
+
+    # ---------- 克隆图章 ----------
+    src = np.zeros((60, 60, 4), np.uint8)
+    src[..., :3] = (200, 120, 60)
+    src[..., 3] = 255
+    snap = rt.CloneSource(src.copy(), 10, 30, 0.5, 12)
+    assert snap.shape == (60, 60)
+    assert snap.copy().ox == 10 and snap.copy() is not snap
+
+    # 覆盖：中心应该被完全换成源的颜色，远处一个字节都不动
+    dst = np.zeros((60, 60, 4), np.uint8)
+    dst[..., :3] = (10, 20, 30)
+    dst[..., 3] = 255
+    before = dst.copy()
+    # 采样点与落点重合 -> offset 0，整块都是同一个色，改动最易验证
+    s0 = rt.CloneSource(src.copy(), 30, 30, 1.0, 12)
+    assert rt.clone_stamp_at(dst, s0, 30, 30, 10.0, 0.5, 1.0)
+    assert tuple(dst[30, 30, :3]) == (200, 120, 60), dst[30, 30, :3]
+    assert np.array_equal(dst[0:5, 0:5], before[0:5, 0:5]), "笔刷外被改了"
+
+    # 羽化：硬度 0.5 时圆心的权重必须是 1（覆盖），圆外 0
+    s1 = rt.CloneSource(src.copy(), 30, 30, 0.5, 12)
+    dst2 = np.zeros((60, 60, 4), np.uint8)
+    dst2[..., :3] = (10, 20, 30)
+    dst2[..., 3] = 255
+    rt.clone_stamp_at(dst2, s1, 30, 30, 10.0, 0.5, 1.0)
+    # 半径 10 的羽化圆：x=30 是中心（权重 1），x=38 在圆内靠近边（权重 <1），
+    # x=41 已经在圆外（权重 0）
+    assert dst2[30, 30, 0] == 200, dst2[30, 30, 0]
+    edge = int(dst2[30, 38, 0])
+    assert edge < 200, "边缘该比中心淡（羽化生效）"
+    assert edge > 10, "边缘不该被完全忽略，实际 %d" % edge
+    assert dst2[30, 41, 0] == 10, "圆外不该动，实际 %d" % dst2[30, 41, 0]
+
+    # 采样源被隔离：改了 dst 之后 src 一个字节都不能变
+    assert np.array_equal(s1.image, src), "采样源被目标污染了"
+    # 同图克隆不会自我放大（PS 的关键性质）
+    same = np.zeros((80, 80, 4), np.uint8)
+    ry, rx = np.mgrid[0:80, 0:80]
+    same[((rx // 7 + ry // 7) % 2) == 0, :3] = (200, 120, 60)
+    same[..., 3] = 255
+    before2 = same.copy()
+    n = rt.clone_stroke_path(same, rt.CloneSource(same.copy(), 10, 40, 0.5, 10),
+                             [(40, 40), (70, 45)], 9.0, 0.5, 1.0)
+    assert n > 0, "克隆路径一次都没盖上"
+    # 采样源区域（画布左上那一片）必须逐位未动
+    assert np.array_equal(same[5:15, 5:15], before2[5:15, 5:15]), \
+        "同图克隆改了采样源区"
+
+    # 边界：源窗口一半出界要画能画的那部分；完全出界返回 False
+    edge_img = np.zeros((40, 40, 4), np.uint8)
+    edge_img[..., :3] = (50, 60, 70)
+    edge_img[..., 3] = 255
+    red = np.zeros((40, 40, 4), np.uint8)
+    red[..., :3] = (200, 10, 10)
+    red[..., 3] = 255
+    assert rt.clone_stamp_at(edge_img, rt.CloneSource(red, 2, 20, 0.5, 10),
+                             36, 20, 9.0, 0.5, 1.0), "源一半出界该还能画"
+    assert not rt.clone_stamp_at(edge_img,
+                                 rt.CloneSource(red, -100, 20, 0.5, 10),
+                                 30, 20, 9.0, 0.5, 1.0), "源完全出界该返回 False"
+    # 尺寸不符 / 半径太小 / strength=0 都该安全返回
+    assert not rt.clone_stamp_at(np.zeros((10, 10, 4), np.uint8),
+                                 rt.CloneSource(np.zeros((40, 40, 4), np.uint8),
+                                                5, 5), 5, 5, 3.0)
+    assert not rt.clone_stamp_at(edge_img, rt.CloneSource(red, 20, 20),
+                                 20, 20, 0.3)
+    assert not rt.clone_stamp_at(edge_img, rt.CloneSource(red, 20, 20),
+                                 20, 20, 9.0, 0.5, 0.0)
+    assert rt.clone_stroke_path(edge_img, rt.CloneSource(red, 20, 20),
+                                [], 9.0) == 0
+    print("  克隆图章：中心全覆盖 / 羽化边缘 / 采样源隔离 / 同图不自我放大 "
+          "/ 出界只画能画的")
+
+    # ---------- 污点修复 ----------
+    img = np.zeros((80, 80, 4), np.uint8)
+    img[..., :3] = (100, 120, 140)
+    img[..., 3] = 255
+    ry, rx = np.mgrid[0:80, 0:80]
+    img[((rx * 7 + ry * 13) % 23) < 2, :3] = (140, 140, 140)   # 细纹理
+    img[36:44, 36:44, :3] = (250, 20, 20)                    # 深色瑕点
+    lum0 = img[..., :3].astype(np.int16).mean(axis=2)
+    tex_before = float(lum0[28:34, 28:34].std())
+    assert tex_before > 1.0, "底图该有纹理可对照"
+    assert rt.heal_region(img, 40, 40, 8.0, 0.5, 1.0)
+    lum1 = img[..., :3].astype(np.int16).mean(axis=2)
+    # 瑕点区的颜色要被拉回周围水平
+    spot = float(lum1[38:42, 38:42].mean())
+    around = float(lum1[26:32, 26:32].mean())
+    assert abs(spot - around) < 45, \
+        "瑕点没被修掉（spot=%.1f around=%.1f）" % (spot, around)
+    # 周围纹理不能被抹平（污点修复 != 模糊）
+    tex_after = float(lum1[28:34, 28:34].std())
+    assert tex_after > tex_before * 0.5, \
+        "纹理被抹平了（%.2f -> %.2f）" % (tex_before, tex_after)
+    # 笔刷外不受影响
+    snap2 = lum1.copy()
+    assert not rt.heal_region(img, 40, 40, 8.0, 0.5, 0.0), "strength=0 该是空操作"
+    assert np.array_equal(lum1, snap2)
+    # 破洞（alpha=0）也要能修
+    hole = np.zeros((60, 60, 4), np.uint8)
+    hole[..., :3] = (120, 120, 120)
+    hole[..., 3] = 255
+    hole[28:32, 28:32] = 0
+    assert rt.heal_region(hole, 30, 30, 6.0, 0.5, 1.0)
+    assert hole[30, 30, 3] > 200, "破洞的 alpha 该被补上（实际 %d）" % hole[30, 30, 3]
+    print("  污点修复：颜色拉回周围 / 纹理不抹平 / 破洞 alpha 补上 / "
+          "strength=0 空操作")
+
+    # ---------- 形状（core 层只有遮罩，UI 层测落笔）----------
+    # 这里只测「羽化 + 布尔运算」这两个底层，形状的三种样式在 uitest 里测
+    # **erode 必须给 borderType / borderValue**：默认的 border 处理会把
+    # 外沿一起吃掉，整圈变成 0（描边就没了）。给 BORDER_CONSTANT=0 之后
+    # 「画布外当空」-> 外沿保住了
+    m = np.zeros((41, 41), np.uint8)
+    m[4:37, 4:37] = 255
+    er = cv2.erode(m, np.ones((3, 3), np.uint8), iterations=2,
+                   borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    ring = np.clip(m.astype(np.float32) - er.astype(np.float32), 0.0, 1.0)
+    assert ring[20, 20] == 0.0, "描边：中心该被挖空"
+    assert ring[20, 4] == 1.0, "描边：外沿该保留"
+    assert ring[4, 4] == 1.0, "描边：四角该保留"
+    assert ring[20, 2] == 0.0, "描边：形状外面不该有事"
+    assert 0 < ring.sum() < m.sum(), "描边不该是实心或全空"
+    print("  形状：描边的空心 / 外沿保留 / 边缘过渡都对")
+
+
+def _texture_img(w, h):
+    """造一张有明确纹理的图：渐变底 + 棋盘，用来验填充不是"糊成一片"。"""
+    yy, xx = np.mgrid[0:h, 0:w]
+    img = np.zeros((h, w, 4), np.uint8)
+    img[..., 0] = (xx * 255 // max(1, w - 1))
+    img[..., 1] = (yy * 255 // max(1, h - 1))
+    img[..., 2] = 128
+    chk = (((xx // 16 + yy // 16) % 2) * 60).astype(np.int32)
+    img[..., :3] = np.clip(img[..., :3].astype(np.int32) + chk[..., None],
+                           0, 255).astype(np.uint8)
+    img[..., 3] = 255
+    return img
+
+
+def test_content_aware():
+    """内容感知填充（第二十二批）：邻近 / 镜像 / 纹理合成 / 扩展画布。"""
+    from src.core.content_aware import (FILL_MODES,
+                                        extend_canvas_content_aware,
+                                        fill_content_aware)
+    assert FILL_MODES == ("邻近", "镜像", "纹理合成"), FILL_MODES
+
+    h, w = 200, 260
+    img = _texture_img(w, h)
+    sel = np.zeros((h, w), np.float32)
+    sel[80:130, 100:170] = 1.0
+
+    # ---------- 三种模式：选区外逐位不变 ----------
+    for mode in FILL_MODES:
+        out = fill_content_aware(img, sel, mode=mode)
+        assert out.shape == img.shape, mode
+        assert out.dtype == np.uint8, mode
+        # 选区外一像素都没动（羽化也不能渗出去）
+        keep = sel.copy()
+        keep[78:132, 98:172] = 1.0
+        assert np.array_equal(out[keep == 0], img[keep == 0]), \
+            "%s：选区外的像素被改了" % mode
+        # 选区里确实被改写了（不能是原样返回）
+        assert not np.array_equal(out[sel >= 0.5], img[sel >= 0.5]), \
+            "%s：选区里什么都没变" % mode
+        assert out[..., 3].min() >= 0 and out[..., 3].max() <= 255, mode
+
+    # ---------- 邻近 vs 纹理合成：纹理合成该保留更多高频 ----------
+    near = fill_content_aware(img, sel, mode="邻近")
+    tex = fill_content_aware(img, sel, mode="纹理合成")
+    hi_near = float(np.abs(np.diff(near[85:125, 105:165, :3].astype(float),
+                                   axis=1)).mean())
+    hi_tex = float(np.abs(np.diff(tex[85:125, 105:165, :3].astype(float),
+                                  axis=1)).mean())
+    assert hi_tex > hi_near, \
+        "纹理合成该比邻近保留更多纹理：%.2f vs %.2f" % (hi_tex, hi_near)
+
+    # ---------- 镜像：把关于包围盒中轴的对侧像素翻过来 ----------
+    # 注意语义：翻完之后**不保证自对称**（选区本身未必对称），
+    # 该验的是「翻过去的那个像素 = 原图同一行的镜像位置」
+    mir = fill_content_aware(img, sel, mode="镜像", feather=0.0)
+    x0, y0, x1, y1 = 100, 80, 170, 130
+    cx = (x0 + x1 - 1) / 2.0
+    ok = 0
+    tot = 0
+    # feather=0 就是硬边，全选区都该逐位等于对侧像素
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            mx = int(round(2 * cx - x))
+            if not (x0 <= mx < x1):
+                continue
+            tot += 1
+            if abs(int(mir[y, x, 0]) - int(img[y, mx, 0])) <= 2:
+                ok += 1
+    assert tot > 0 and ok / tot > 0.98, \
+        "镜像填充取的不是对侧像素：%d/%d" % (ok, tot)
+
+    # ---------- 羽化 0 是硬边，羽化大要限幅（不能整片半透明） ----------
+    hard = fill_content_aware(img, sel, feather=0.0)
+    soft = fill_content_aware(img, sel, feather=64.0)
+    inside_min = float(hard[85:125, 105:165, :3].min())
+    assert inside_min >= 0, hard[80:130, 100:170, :3].min()
+    # 大羽化被限幅到选区尺寸的一半，仍不该出现"整块 50% 灰"
+    assert soft[..., 3].min() >= 0, "羽化不该把 alpha 推到负值"
+    assert abs(float(soft[..., 3].mean()) - 255.0) < 1.0, \
+        "不透明图的 alpha 填充后仍该是 255"
+
+    # ---------- 半透明图：预乘往返不能出脏黑边（§3.2）----------
+    # 整图 alpha = 128（半透明）。如果忘了预乘、直接卷 rgb，
+    # 透明侧的 0 会被卷进来，填出来的那块会明显偏暗。
+    rgba = img.copy()
+    rgba[..., 3] = 128
+    out = fill_content_aware(rgba, sel, mode="邻近", feather=3.0)
+    assert int(out[..., 3].min()) == 128 and int(out[..., 3].max()) == 128, \
+        "整图半透明时填充不该改alpha：%d..%d" % (out[..., 3].min(),
+                                       out[..., 3].max())
+    # 填出来的那块亮度应该跟"直接把选区均值抹平"差不多，
+    # 而不是塌到接近 0（那就是没预乘的典型症状）
+    src_lum = float(img[85:125, 105:165, :3].mean())
+    out_lum = float(out[85:125, 105:165, :3].mean())
+    assert abs(out_lum - src_lum) < 40, \
+        "半透明填充亮度塌了：%.1f -> %.1f（多半是没预乘）" % (src_lum, out_lum)
+
+    # 选区紧贴半透明图的一角时，填出来那块也不能比周围暗太多
+    corner = np.zeros((h, w), np.float32)
+    corner[h - 30:h, w - 40:w] = 1.0
+    out2 = fill_content_aware(rgba, corner, mode="邻近", feather=0.0)
+    ring = out2[h - 45:h - 30, w - 40:w, :3].mean()
+    assert abs(float(out2[h - 30:h, w - 40:w, :3].mean())
+               - float(ring)) < 40, "贴边填充与紧邻区域亮度差过大"
+
+    # ---------- 空选区：原样返回，不报错 ----------
+    empty = np.zeros((h, w), np.float32)
+    assert np.array_equal(fill_content_aware(img, empty), img)
+
+    # ---------- 扩展画布外的空白 ----------
+    for mode in FILL_MODES:
+        ex = extend_canvas_content_aware(img, sel, left=40, bottom=30, mode=mode)
+        assert ex.shape == (h + 30, w + 40, 4), (mode, ex.shape)
+        # **原图逐位保留** —— 扩展画布绝不能动原图像素
+        assert np.array_equal(ex[0:h, 40:40 + w], img), \
+            "%s：扩展画布把原图像素改了" % mode
+        # 新增的那条边不该是纯黑（全透明处被填成啥）
+        new_strip = ex[h:h + 30, 40:40 + w, :3]
+        assert float(new_strip.mean()) > 5.0, \
+            "%s：新边一片死黑 mean=%.1f" % (mode, new_strip.mean())
+
+    # 四边都能扩
+    ex4 = extend_canvas_content_aware(img, None, 10, 20, 30, 40, mode="邻近")
+    assert ex4.shape == (h + 60, w + 40, 4), ex4.shape
+    assert np.array_equal(ex4[20:20 + h, 10:10 + w], img), "四边扩展没保住原图"
+
+    # ---------- 性能：大选区不能变成幻灯片 ----------
+    big = np.zeros((900, 900), np.float32)
+    big[200:800, 200:800] = 1.0
+    # **tile 的第 0 轴才是行** —— 用第 1 轴会把图铺成 (200, 900, 16)，
+    # 那样选区根本不在图里，填充会直接原样返回（测了个寂寞）
+    bigimg = np.tile(_texture_img(260, 200), (5, 5, 1))[:900, :900]
+    assert bigimg.shape == (900, 900, 4), bigimg.shape
+    before = bigimg[200:800, 200:800, :3].copy()
+    t0 = time.time()
+    out = fill_content_aware(bigimg, big, mode="纹理合成")
+    dt = time.time() - t0
+    # 大选区必须真的被重写（不是原样返回）
+    changed = float((np.abs(out[200:800, 200:800, :3].astype(np.int32)
+                            - before.astype(np.int32)).sum(axis=2) > 2).mean())
+    assert changed > 0.5, "大选区只有 %.1f%% 被填充，等于没干活" % (changed * 100)
+    assert np.array_equal(out[:200, :], bigimg[:200, :]), "选区外被改了"
+    assert dt < 3.0, "纹理合成 600x600 选区用了 %.2fs，太慢" % dt
+    # **残留判据要用「原色」而不是固定亮度阈值**。这个 bug 藏了很久：
+    # 块与块之间留缝 -> 缝里还是原始内容，但洞本身的纹理也有暗像素，
+    # 用 `亮度 < 90` 去数会两边都算进去，看着像"残留"又像"正常纹理"。
+    # 只认「和要抹掉的那个色完全一样」的像素才对。
+    target = np.array([38, 42, 58])
+    before_big = bigimg[200:800, 200:800, :3].astype(np.int32)
+    out_big = fill_content_aware(bigimg, big, mode="纹理合成")
+    sub = out_big[200:800, 200:800, :3].astype(np.int32)
+    left = float((np.abs(sub - target[None, None, :]).max(axis=2) <= 4).mean())
+    assert left < 0.001, "纹理合成残留了 %.1f%% 的原始内容（块之间有缝）" \
+        % (left * 100)
+    assert not np.array_equal(sub, before_big), "纹理合成什么都没改"
+
+    # 每种采样范围 × 块边长组合都不能留缝 —— 之前只在 sr=48 下测过，
+    # sr 一放大就露馅（ROI 变大 -> 候选变粗 -> 匹配退化）
+    for sr in (48, 96, 192):
+        for p in (9, 21):
+            o = fill_content_aware(bigimg, big, mode="纹理合成",
+                                   patch=p, search=sr)
+            s = o[200:800, 200:800, :3].astype(np.int32)
+            lf = float((np.abs(s - target[None, None, :]).max(axis=2)
+                        <= 4).mean())
+            assert lf < 0.001, "sr=%d patch=%d 残留 %.1f%%" % (sr, p, lf * 100)
+
+    print("  内容感知：三种模式 / 选区外不变 / 镜像对称 / 半透明无脏边 / "
+          "扩展画布保真 / 900px 选区 %.2fs（%.0f%% 被填充，0 残留）"
+          % (dt, changed * 100))
+
+
+def test_canvas_size():
+    """画布大小（第二十二批）：九宫格锚点 + 逐层扩展 + 纯色填边。"""
+    from src.core.document import ANCHORS, _ANCHOR_OFFSETS
+    assert len(ANCHORS) == 9 and len(_ANCHOR_OFFSETS) == 9
+    assert ANCHORS[4] == "居中" and _ANCHOR_OFFSETS["居中"] == (0.5, 0.5)
+    assert _ANCHOR_OFFSETS["左上"] == (0.0, 0.0)
+    assert _ANCHOR_OFFSETS["右下"] == (1.0, 1.0)
+
+    from src.core.content_aware import extend_canvas_content_aware
+    w, h = 300, 200
+    doc = Document(w, h)
+    img = np.zeros((h, w, 4), np.uint8)
+    img[..., :3] = (120, 180, 90)
+    img[..., 3] = 255
+    doc.layers.append(make_image_layer("底", img, w, h))
+    doc.layers[0].tx = doc.layers[0].ty = 0
+
+    # 锚点换算：钉左上 -> 左边和上边扩
+    fx, fy = _ANCHOR_OFFSETS["左上"]
+    dx = int(round(fx * (400 - w)))
+    assert (dx, int(round(fy * (300 - h)))) == (0, 0)
+    fx, fy = _ANCHOR_OFFSETS["右下"]
+    assert (int(round(fx * (400 - w))), int(round(fy * (300 - h)))) == (100, 100)
+
+    # 扩展函数本身对"扩出去的量"的语义：left/top 是往左/往上扩
+    ex = extend_canvas_content_aware(img, None, 10, 5, 0, 0)
+    assert ex.shape == (h + 5, w + 10, 4), ex.shape
+    assert np.array_equal(ex[5:5 + h, 10:10 + w], img), "原图没保住"
+
+    # 负数 / 零尺寸要能被夹住，不能崩
+    ex0 = extend_canvas_content_aware(img, None, 0, 0, 0, 0)
+    assert ex0.shape == img.shape
+    print("  画布大小：九宫格锚点换算 / 四边扩展 / 零扩展安全")
+
+
+def test_guides():
+    """向导：参考线 / 网格 / 标尺刻度 / 吸附（core/guides.py，第二十一批）。"""
+    import cv2
+    from src.core import guides as GD
+    from src.core.document import Document, make_image_layer
+
+    gs = GD.GuideSet()
+    assert gs.guides == []
+    assert gs.grid.visible is False
+
+    # ---------- 参考线增删改查 ----------
+    g1 = gs.add(GD.V_GUIDE, 100.0)
+    g2 = gs.add(GD.H_GUIDE, 250.0)
+    assert len(gs.guides) == 2
+    assert g1.is_horizontal is False and g2.is_horizontal is True
+    assert gs.find(g1.id) is g1
+    assert gs.find("nope") is None
+    near = gs.nearest(GD.V_GUIDE, 104.0, 6.0)
+    assert near is not None and near[0] is g1 and near[1] == 4.0
+    assert gs.nearest(GD.V_GUIDE, 200.0, 6.0) is None
+    assert gs.nearest(GD.H_GUIDE, 104.0, 6.0) is None, "方向要对"
+    assert gs.remove(g1.id) is True
+    assert gs.remove("nope") is False
+    assert len(gs.guides) == 1
+    gs.clear()
+    assert gs.guides == []
+
+    # ---------- 网格 ----------
+    assert GD.GridSpec(False, 50.0).lines(200, 200) == ([], [])
+    g4 = GD.GridSpec(True, 50.0, 1)
+    xs, ys = g4.lines(200, 200)
+    assert xs == [50.0, 100.0, 150.0] and ys == [50.0, 100.0, 150.0], xs
+    g4.subdiv = 4
+    xs, _ys = g4.lines(200, 200)
+    # 细线在大格内部等距（50/4 = 12.5）。200 px 宽里有 3 个大格，
+    # 每格 4 等分 -> 3 条大格线 + 3×3 条细线 = 12 条
+    assert len(xs) == 12, len(xs)
+    gaps = {round(xs[i + 1] - xs[i], 4) for i in range(len(xs) - 1)}
+    assert gaps == {12.5}, gaps
+    # 细分越多线越密
+    g8 = GD.GridSpec(True, 50.0, 8)
+    assert len(g8.lines(200, 200)[0]) > len(xs)
+
+    # ---------- 标尺刻度 ----------
+    ticks, major = GD.ruler_ticks(0, 800, 10.0, 80.0)
+    assert ticks and len(major) >= 1
+    assert ticks[0] == 0.0
+    gaps = {round(ticks[i + 1] - ticks[i], 4) for i in range(len(ticks) - 1)}
+    assert len(gaps) == 1, "刻度间隔必须均匀，实际 %s" % gaps
+    # 屏幕间隔要求越大（缩得越小）-> 世界坐标的刻度间隔要更大
+    far, _ = GD.ruler_ticks(0, 800, 10.0, 400.0)
+    step_near = ticks[1] - ticks[0] if len(ticks) > 1 else 0.0
+    step_far = far[1] - far[0] if len(far) > 1 else 0.0
+    assert step_far > step_near, (step_near, step_far)
+    assert GD.ruler_ticks(0, 0) == ([], set())
+    assert GD.ruler_ticks(10.0, 5.0) == ([], set())
+
+    # ---------- 吸附：优先级 文档 > 参考线 > 网格 > 图层 ----------
+    doc = Document(800, 600, "g")
+    lay = make_image_layer("L", np.zeros((100, 120, 4), np.uint8), 120, 100)
+    lay.tx, lay.ty = 300.0, 200.0
+    doc.layers.append(lay)
+
+    # 图层自身的可吸附位置：左右边界 + 中心
+    vs, hs = GD.layer_edges_and_centers(lay)
+    assert abs(vs[0] - 240.0) < 0.01 and abs(vs[1] - 360.0) < 0.01
+    assert abs(vs[2] - 300.0) < 0.01
+    assert abs(hs[0] - 150.0) < 0.01 and abs(hs[1] - 250.0) < 0.01
+    # 旋转 45° 后吸附位置跟着变（AABB）
+    lay.rot = 45.0
+    vs45, _ = GD.layer_edges_and_centers(lay)
+    assert abs(vs45[0] - 222.2) < 0.2 and abs(vs45[1] - 377.8) < 0.2, vs45
+    lay.rot = 0.0
+    # 没有 src_size 的图层不该炸
+    from src.core.layer import Layer
+    assert GD.layer_edges_and_centers(Layer("x")) == ([], [])
+
+    g = GD.GuideSet()
+    # 文档边界：x 只能吸到 0 / doc_w，y 只能吸到 0 / doc_h
+    x, y, h = GD.snap_point(2.0, 2.0, g, 800, 600)
+    assert (x, y) == (0.0, 0.0), (x, y)
+    x, y, h = GD.snap_point(798.0, 598.0, g, 800, 600)
+    assert (x, y) == (800.0, 600.0), (x, y)
+    # 关键回归：x 轴**不能**吸到 doc_h（曾经写岔了，y 会吸到右边界）
+    x, y, h = GD.snap_point(599.0, 500.0, g, 800, 600)
+    assert abs(x - 599.0) < 0.01 or any(
+        k == GD.SNAP_DOC for k, a in h if a == "x"), (x, h)
+    # 参考线赢过图层
+    g.add(GD.V_GUIDE, 241.0)
+    x, _y, h = GD.snap_point(243.0, 500.0, g, 800, 600, layers=[lay])
+    assert abs(x - 241.0) < 0.01, x
+    assert GD.SNAP_GUIDE in [k for k, _a in h], h
+    # 关掉参考线吸附后就该吸图层
+    g.snap_guides = False
+    x, _y, h = GD.snap_point(243.0, 500.0, g, 800, 600, layers=[lay])
+    assert abs(x - 240.0) < 0.01, x
+    assert GD.SNAP_LAYER in [k for k, _a in h], h
+    # 关掉图层吸附 -> 不吸图层
+    g.snap_layers = False
+    x, _y, h = GD.snap_point(243.0, 500.0, g, 800, 600, layers=[lay])
+    assert abs(x - 243.0) < 0.01, x
+    # exclude 能排除自身
+    g.snap_layers = True
+    x, _y, _h = GD.snap_point(243.0, 500.0, g, 800, 600, layers=[lay],
+                              exclude=lay)
+    assert abs(x - 243.0) < 0.01, x
+    # 网格
+    g2 = GD.GuideSet()
+    g2.grid = GD.GridSpec(True, 20.0, 1)
+    x, _y, h = GD.snap_point(41.0, 500.0, g2, 800, 600)
+    assert abs(x - 40.0) < 0.01, x
+    assert GD.SNAP_GRID in [k for k, _a in h], h
+    # 网格细分也参与吸附
+    g2.grid.subdiv = 4
+    x, _y, _h = GD.snap_point(36.0, 500.0, g2, 800, 600)
+    assert abs(x - 35.0) < 0.01, x        # 20 + 20/4*3 = 35
+    # 网格关掉就不吸
+    g2.grid.visible = False
+    x, _y, _h = GD.snap_point(41.0, 500.0, g2, 800, 600)
+    assert abs(x - 41.0) < 0.01, x
+    # x / y 各自独立：只该有一边被修正
+    g3 = GD.GuideSet()
+    g3.add(GD.V_GUIDE, 100.0)
+    x, y, h = GD.snap_point(103.0, 333.0, g3, 800, 600)
+    assert abs(x - 100.0) < 0.01 and abs(y - 333.0) < 0.01, (x, y)
+    assert len(h) == 1, h
+    # 全关 -> 原样返回
+    g4 = GD.GuideSet()
+    g4.snap_doc = g4.snap_guides = g4.snap_grid = g4.snap_layers = False
+    x, y, h = GD.snap_point(3.0, 7.0, g4, 800, 600, layers=[lay])
+    assert (x, y) == (3.0, 7.0) and h == [], (x, y, h)
+    # 容差之外不吸
+    x, _y, _h = GD.snap_point(130.0, 500.0, g3, 800, 600)
+    assert abs(x - 130.0) < 0.01, x
+    # 提示语
+    assert "参考线" in GD.snap_label([(GD.SNAP_GUIDE, "x")])
+    assert "参考线 · 网格" in GD.snap_label([(GD.SNAP_GUIDE, "x"),
+                                             (GD.SNAP_GRID, "y")])
+    assert GD.snap_label([]) == ""
+
+    # ---------- 存取往返 / 老工程 ----------
+    gs2 = GD.GuideSet()
+    gs2.add(GD.V_GUIDE, 88.0)
+    gs2.add(GD.H_GUIDE, 66.0)
+    gs2.grid = GD.GridSpec(True, 25.0, 4)
+    gs2.snap_grid = False
+    back = GD.GuideSet.from_dict(gs2.to_dict())
+    assert len(back.guides) == 2
+    assert [(g.kind, g.pos) for g in back.guides] == \
+        [(GD.V_GUIDE, 88.0), (GD.H_GUIDE, 66.0)]
+    assert back.grid.to_dict() == gs2.grid.to_dict()
+    assert back.snap_grid is False and back.snap_guides is True
+    # 坏条目安静跳过，不抛
+    bad = GD.GuideSet.from_dict({"guides": [{"kind": "x"}], "grid": None})
+    assert len(bad.guides) == 0 and bad.grid.spacing > 0
+    assert GD.GuideSet.from_dict(None).guides == []
+    assert GD.GuideSet.from_dict({}).guides == []
+
+    # ---------- Document 集成：clone 要深拷贝（参考线不是 numpy 数组）----------
+    d2 = Document(200, 150, "x")
+    d2.guides.add(GD.V_GUIDE, 88.0)
+    d2.guides.grid = GD.GridSpec(True, 25.0, 4)
+    snap = d2.clone()
+    d2.guides.guides[0].pos = 999.0
+    d2.guides.grid.spacing = 77.0
+    assert snap.guides.guides[0].pos == 88.0, "clone 里的参考线被改到了"
+    assert snap.guides.grid.spacing == 25.0, "clone 里的网格被改到了"
+    print("  向导：参考线增删查 / 网格细分 / 标尺档位 / 吸附四级优先级 "
+          "(文档>参考线>网格>图层) / x-y 独立 / exclude / 存取往返 / clone 隔离")
+
+
 def test_channels():
     """第十七批：通道模型（core.channels）—— Alpha 通道 + RGB 显示开关。"""
     from src.core import channels as ch
@@ -3651,6 +4280,177 @@ def test_smart_edge_cases():
     print("  内容回收：没有实例引用时自动清理")
 
 
+def test_svg_import():
+    """SVG 导入（第二十三批）：解析 + 栅格化，每条语法支路都得画得出来。"""
+    from tools.svgfixture import ALL_SVG
+    from src.core.project_io import imread_rgba
+    from src.core.svg_import import _path_data, render_svg, svg_size
+
+    # ---------- 空图 / 固有尺寸 ----------
+    a = render_svg(ALL_SVG["empty"])
+    assert a.shape == (60, 100, 4) and a.dtype == np.uint8
+    assert int(a[..., 3].sum()) == 0, "空图必须全透明"
+    assert svg_size(ALL_SVG["empty"]) == (100, 60)
+    # 既没有尺寸也没有 viewBox：按 SVG 规范给 300×150
+    assert svg_size('<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" '
+                    'height="10"/></svg>') == (300, 150)
+
+    # ---------- 基本形状：画上去了 + 该透的地方透 ----------
+    a = render_svg(ALL_SVG["shapes"])
+    assert a[30, 30, :3].tolist() == [231, 76, 60], a[30, 30]      # #e74c3c
+    assert a[30, 30, 3] == 255
+    assert a[170, 30, 3] == 0, "矩形外必须透明"
+    for name in ("shapes", "path", "transforms", "gradients", "strokes",
+                 "arcs", "clip", "use", "style"):
+        arr = render_svg(ALL_SVG[name])
+        assert arr.shape[2] == 4, name
+        frac = float((arr[..., 3] > 0).mean())
+        assert frac > 0.01, "%s 只画出 %.2f%% 的像素" % (name, frac * 100)
+
+    # ---------- transform 位置 ----------
+    a = render_svg(ALL_SVG["transforms"])
+    assert a[40, 40, :3].tolist() == [41, 128, 185], a[40, 40]     # translate 后的蓝块
+    assert a[5, 40, 3] == 0, "translate(20,20) 之前不该有东西"
+    assert a[20, 90, :3].tolist() == [192, 57, 43], a[20, 90]      # translate+scale 后的红圆
+
+    # ---------- 渐变：线性两端 + 中点 ----------
+    g = render_svg('<svg xmlns="http://www.w3.org/2000/svg" width="40" '
+                   'height="10"><defs><linearGradient id="a">'
+                   '<stop offset="0" stop-color="#0000ff"/>'
+                   '<stop offset="1" stop-color="#ff0000"/></linearGradient>'
+                   '</defs><rect x="0" y="0" width="40" height="10" '
+                   'fill="url(#a)"/></svg>')
+    # 端点不写精确值：抗锯齿会把最外一列的 rgb 拉偏（premultiplied 下的边缘像素）
+    assert g[5, 2, 2] > 200 and g[5, 2, 0] < 60, g[5, 2]      # 明显偏蓝
+    assert g[5, 37, 0] > 200 and g[5, 37, 2] < 60, g[5, 37]   # 明显偏红
+    assert g[5, 19, 0] > 100, "中点应该已经过半偏红"
+    # userSpaceOnUse 的另一条渐变（坐标是用户空间，不跟着 bbox 走）
+    g2 = render_svg('<svg xmlns="http://www.w3.org/2000/svg" width="50" '
+                    'height="10"><defs><linearGradient id="b" '
+                    'gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="50" '
+                    'y2="0"><stop offset="0" stop-color="#000"/>'
+                    '<stop offset="1" stop-color="#fff"/></linearGradient>'
+                    '</defs><rect x="0" y="0" width="50" height="10" '
+                    'fill="url(#b)"/></svg>')
+    assert g2[5, 1, 0] < 40 and g2[5, 48, 0] > 215, (g2[5, 1], g2[5, 48])
+    # 径向渐变：圆心是白的
+    rg = render_svg('<svg xmlns="http://www.w3.org/2000/svg" width="40" '
+                    'height="40"><defs><radialGradient id="c">'
+                    '<stop offset="0" stop-color="#fff"/>'
+                    '<stop offset="1" stop-color="#000"/></radialGradient>'
+                    '</defs><circle cx="20" cy="20" r="20" '
+                    'fill="url(#c)"/></svg>')
+    # 圆心不写 255：Qt 对「focus 与圆心重合」的径向渐变，圆心不是精确的 stop0
+    assert rg[20, 20, 0] > 235, rg[20, 20]
+    assert rg[20, 2, 0] < 60, rg[20, 2]
+
+    # ---------- 弧（A 命令）----------
+    p = _path_data("M0 20 A20 20 0 0 1 40 20 Z")
+    bb = p.boundingRect()
+    assert abs(bb.width() - 40) < 0.5 and abs(bb.height() - 20) < 0.5, bb
+    half = _path_data("M0 0 A50 50 0 0 1 100 0")
+    assert abs(half.boundingRect().height() - 50) < 0.5, \
+        half.boundingRect().height()
+    # 半径不够包住两端点时应该被**等比**放大，不是崩掉
+    tiny = _path_data("M0 0 A2 100 0 0 1 40 0")
+    assert tiny.boundingRect().width() > 39, tiny.boundingRect()
+    # 半径 0 退化成直线，不能死循环
+    assert _path_data("M0 0 A0 0 0 0 1 30 30").boundingRect().width() >= 0
+
+    # ---------- clip / use / style ----------
+    a = render_svg(ALL_SVG["clip"])
+    assert a[100, 100, 3] > 250, "clip 圆内"
+    assert a[5, 5, 3] == 0, "clip 圆外必须透明"
+    assert a[60, 150, :3].tolist() == [46, 204, 113], a[60, 150]
+    a = render_svg(ALL_SVG["use"])
+    assert a[40, 40, :3].tolist() == [231, 76, 60], a[40, 40]
+    assert a[100, 100, :3].tolist() == [231, 76, 60], a[100, 100]
+    a = render_svg(ALL_SVG["style"])
+    assert a[30, 50, :3].tolist() == [233, 30, 99], a[30, 50]      # 内联 style
+    assert 80 < a[30, 150, 3] < 230, a[30, 150]                    # fill-opacity 0.4
+    assert 80 < a[90, 150, 3] < 230, a[90, 150]                    # group opacity 0.5
+
+    # ---------- 文字（离屏 Qt 常常没有字体，有权画不出但绝不能崩）----------
+    # **没有 QApplication 时 drawText / QFontDatabase.families() 是段错误
+    # 直接带崩进程**（127 且无任何输出），所以先 _ensure_gui() 再问字体。
+    _ensure_gui()
+    from src.core.text import ensure_fonts
+    ensure_fonts()
+    from PySide6.QtGui import QFontDatabase
+    if QFontDatabase.families():
+        t = render_svg(ALL_SVG["text"])
+        assert int((t[..., 3] > 0).sum()) > 50, "有字体却没画出文字"
+    else:
+        render_svg(ALL_SVG["text"])
+
+    # ---------- 走文件路径 + imread_rgba ----------
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "x.svg")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(ALL_SVG["shapes"])
+        arr = imread_rgba(p, target=(80, 80))
+        assert arr.shape == (80, 80, 4), arr.shape
+        assert int(arr[..., 3].sum()) > 0
+        # 缩小 200→80 之后内容得落在画面中心附近（(40,40) 那点本身在
+        # 图形边界上，抗锯齿只给 204，别拿它当「画上了」的判据）
+        ys, xs = np.nonzero(arr[..., 3] > 8)
+        assert abs(float(xs.mean()) - 40) < 8 and abs(float(ys.mean()) - 40) < 8, \
+            (float(xs.mean()), float(ys.mean()))
+
+    # ---------- 尺寸上限 ----------
+    big = render_svg('<svg xmlns="http://www.w3.org/2000/svg" width="90000" '
+                     'height="20"><rect width="90000" height="20" '
+                     'fill="#f00"/></svg>', width=None, height=20)
+    assert big.shape == (20, 20, 4), big.shape       # 被夹到 MAX_DIM
+
+    print("  SVG 导入：%d 份样例全画上 / 变换位置 / 三种渐变 / A 弧 / clip / "
+          "use / 内联 style / 尺寸夹取" % len(ALL_SVG))
+
+
+def test_heif_import():
+    try:
+        import io
+        import pillow_heif
+    except ImportError:
+        print("  HEIC 导入跳过（没装 pillow-heif）")
+        return
+    from src.core.project_io import imread_rgba
+
+    w, h = 40, 24
+    src = np.zeros((h, w, 4), np.uint8)
+    src[..., 0] = 200
+    src[..., 1] = 90
+    src[..., 3] = 255
+
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "t.heic")
+        buf = io.BytesIO()
+        pillow_heif.register_heif_opener()
+        pillow_heif.encode("RGBA", (w, h), src.tobytes(), buf, quality=90)
+        with open(p, "wb") as f:
+            f.write(buf.getvalue())
+        out = imread_rgba(p)
+        assert out.shape == (h, w, 4), out.shape
+        assert out[..., 3].min() > 250, "alpha 丢了"
+        d0 = int(np.abs(out[..., :3].astype(np.int16) -
+                         src[..., :3]).max())
+        assert d0 <= 12, "HEIC 往返色差 %d" % d0
+        assert d0 > 0, "HEIC 编解码是有损的，色差为 0 说明在偷懒（分辨率/位深没真走）"
+
+    # 缺依赖时必须给**能照着装的提示**，不是一句 import 失败
+    from src.core import project_io as PIO
+    PIO._HEIF_OK = False
+    try:
+        PIO._require_heif()
+    except RuntimeError as e:
+        assert "pillow-heif" in str(e), str(e)
+    else:
+        raise AssertionError("没装依赖时应该抛错")
+    PIO._HEIF_OK = None
+
+    print("  HEIC 导入：40x24 往返色差 %d/255（有损），缺依赖给安装提示" % d0)
+
+
 def main():
     print("Compositor for Windows —— 自检")
     test_blend_modes_finite()
@@ -3672,6 +4472,11 @@ def main():
     test_psd_import()
     test_psd_text()
     test_psd_effects()
+    test_retouch()
+    test_retouch2()
+    test_content_aware()
+    test_canvas_size()
+    test_guides()
     test_channels()
     test_new_adjustments()
     test_adjustment_enhance()
@@ -3696,6 +4501,8 @@ def main():
     test_smart_object()
     test_smart_project_roundtrip()
     test_smart_edge_cases()
+    test_svg_import()
+    test_heif_import()
     print("全部通过。")
 
 

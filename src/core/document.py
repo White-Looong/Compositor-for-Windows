@@ -10,6 +10,17 @@ from .blend import PASS_THROUGH
 from .layer import (LAYER_ADJUSTMENT, LAYER_GROUP, LAYER_IMAGE, LAYER_SMART,
                     LAYER_TEXT, Layer)
 from .text import default_text_params, render_text
+from . import guides as _guides
+
+
+# 画布大小的九宫格锚点 -> 原点在旧画布里的偏移 (dx, dy)。
+# 名字就是那个格子的位置：「左上」= 钉左上角，所以画布往左上长。
+_ANCHOR_OFFSETS = {
+    "左上": (0, 0), "上": (0.5, 0), "右上": (1.0, 0),
+    "左": (0, 0.5), "居中": (0.5, 0.5), "右": (1.0, 0.5),
+    "左下": (0, 1.0), "下": (0.5, 1.0), "右下": (1.0, 1.0),
+}
+ANCHORS = tuple(_ANCHOR_OFFSETS.keys())
 
 
 # 通道显示开关的初值：R/G/B/A 全开。放在这里是为了让 `Document.__init__`
@@ -69,6 +80,11 @@ class Document:
         self.channel_view = _ch_visible_default()
         self.composite_alpha = None
 
+        # 向导类工具（core/guides.py）：参考线 + 网格 + 吸附开关。
+        # 只影响**显示与拖动吸附**，不动图层数据（改图层几何时要重新吸附，
+        # 但参考线本身与图层无关）
+        self.guides = _guides.GuideSet()
+
     # ---------- 结构 ----------
 
     @property
@@ -93,6 +109,9 @@ class Document:
         # 同 selection：先共享，改之前由 detach_quick_mask() 复制
         d.quick_mask = self.quick_mask
         d.quick_mask_mode = self.quick_mask_mode
+        # 参考线/ 网格是普通 Python 对象，clone 时深拷贝（浅拷贝会被改到，
+        # 撤销栈里存的历史就跟着变了）
+        d.guides = self.guides.from_dict(self.guides.to_dict())
         # 通道遮罩同理：numpy 数组共享，改之前 detach_channel()
         d.channels = [c.copy() for c in (getattr(self, "channels", None) or [])]
         v = getattr(self, "channel_view", None)
@@ -221,6 +240,7 @@ class Document:
             "height": self.height,
             "dpi": self.dpi,
             "layers": [l.to_dict() for l in self.layers],
+            "guides": self.guides.to_dict(),
             "smart": dict((k, c.to_dict())
                           for k, c in (self.smart_contents or {}).items()),
             "channels": _ch_to_dict(self),
@@ -245,6 +265,7 @@ class Document:
         refresh_sizes(doc)
         from . import channels as _ch
         _ch_from_dict(doc, d.get("channels"), images or {})
+        doc.guides = _guides.GuideSet.from_dict(d.get("guides") or {})
         return doc
 
 

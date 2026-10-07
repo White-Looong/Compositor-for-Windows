@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import sys
 
+import math
+
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -228,6 +230,239 @@ def main():
         win._sync_quick_mask_ui()
         win.select_layer(rect.id)
         win.panel.rebuild()
+    elif tool == "guides":
+        # 第二十一批：标尺 + 参考线 + 网格 + 吸附高亮
+        from src.core.document import make_image_layer
+        from src.core import guides as GD
+
+        doc.selection = None
+        for _c in list(doc.channels):
+            doc.channels.remove(_c)
+        doc.composite_alpha = None
+        doc.channel_view = {k: True for k in ("R", "G", "B", "A")}
+        win.channels.rebuild()
+
+        W2, H2 = doc.width, doc.height
+        base = np.zeros((H2, W2, 4), np.uint8)
+        base[..., :3] = (250, 250, 252)
+        base[..., 3] = 255
+        b = make_image_layer("底", base, W2, H2)
+        b.tx, b.ty = W2 / 2.0, H2 / 2.0
+        win.doc.layers.append(b)
+
+        # 一排等宽的色块 —— 演示「吸附到图层」
+        row = []
+        cols = [(228, 92, 84), (238, 160, 76), (232, 202, 92),
+                (140, 196, 116), (86, 178, 202), (96, 138, 214),
+                (150, 116, 210), (208, 108, 176)]
+        for i, c in enumerate(cols):
+            w0 = int(W2 * 0.09)
+            gi = np.zeros((int(H2 * 0.30), w0, 4), np.uint8)
+            gi[..., :3] = c
+            gi[..., 3] = 255
+            gl = make_image_layer("色块%d" % i, gi, w0, int(H2 * 0.30))
+            gl.tx = W2 * 0.08 + i * (w0 + int(W2 * 0.012))
+            gl.ty = H2 * 0.34
+            win.doc.layers.append(gl)
+            row.append(gl)
+
+        # 第二排：三个方块，演示吸附高亮（正在拖动的那个）
+        row2 = []
+        for i, c in enumerate([(60, 130, 200), (70, 170, 150),
+                               (210, 110, 70)]):
+            gi = np.zeros((int(H2 * 0.20), int(W2 * 0.13), 4), np.uint8)
+            gi[..., :3] = c
+            gi[..., 3] = 255
+            gl = make_image_layer("块%d" % i, gi, int(W2 * 0.13),
+                                  int(H2 * 0.20))
+            gl.tx = W2 * 0.20 + i * int(W2 * 0.19)
+            gl.ty = H2 * 0.72
+            win.doc.layers.append(gl)
+            row2.append(gl)
+
+        # 标尺 + 网格
+        win.set_rulers(True)
+        win.set_grid(True, 40.0, 4)
+
+        # 参考线：两条垂直（对齐色块的边）+ 一条水平（过第二排顶边）
+        win.add_guide(GD.V_GUIDE, row[0].tx - W2 * 0.08)
+        win.add_guide(GD.V_GUIDE, row[3].tx - W2 * 0.08)
+        win.add_guide(GD.H_GUIDE, row2[0].ty - H2 * 0.10)
+
+        # 演示吸附：把第二个方块拖到与第一个右边缘对齐
+        win.select_layer(row2[1].id)
+        moved = win.view._snap_layer_move(row2[0].tx + int(W2 * 0.13) + 2.0,
+                                    row2[0].ty, row2[1])
+        win.doc.find(row2[1].id).tx = moved[0]
+        win.doc.find(row2[1].id).ty = moved[1]
+        # 把命中的线高亮画出来（洋红 = PS 的吸附提示色）
+        win.view.set_snap_lines(moved[2])
+        win.commit("吸附演示")
+        win.panel.rebuild()
+        win.inspector.refresh()
+
+    elif tool == "retouch2":
+        # 第二十批：形状 / 污点修复 / 克隆图章
+        from src.core.document import make_image_layer
+        import cv2 as _cv2
+
+        doc.selection = None
+        for _c in list(doc.channels):
+            doc.channels.remove(_c)
+        doc.composite_alpha = None
+        doc.channel_view = {k: True for k in ("R", "G", "B", "A")}
+        win.channels.rebuild()
+
+        W2, H2 = doc.width, doc.height
+        base = np.zeros((H2, W2, 4), np.uint8)
+        base[..., :3] = (243, 244, 247)
+        base[..., 3] = 255
+        b = make_image_layer("底", base, W2, H2)
+        b.tx, b.ty = W2 / 2.0, H2 / 2.0
+        win.doc.layers.append(b)
+
+        # 形状画在单独一层上（画在纹理层上会把纹理盖掉）
+        sh_img = np.zeros((H2, W2, 4), np.uint8)
+        sh_img[..., 3] = 255
+        shl = make_image_layer("形状", sh_img, W2, H2)
+        shl.tx, shl.ty = W2 / 2.0, H2 / 2.0
+        win.doc.layers.append(shl)
+
+        # 纹理层：污点修复与克隆图章的素材
+        ry, rx = np.mgrid[0:H2, 0:W2]
+        tex = np.zeros((H2, W2, 4), np.uint8)
+        tex[..., :3] = (208, 214, 224)
+        tex[..., 3] = 255
+        tex[((rx // 11 + ry // 11) % 2) == 0, :3] = (172, 182, 198)
+        # 左下一块干净的金色：当克隆图章的采样源
+        tex[int(H2 * 0.66):int(H2 * 0.66) + 130,
+            int(W2 * 0.05):int(W2 * 0.05) + 230, :3] = (236, 198, 106)
+        t = make_image_layer("纹理", tex, W2, H2)
+        t.tx, t.ty = W2 * 0.28, H2 * 0.52
+        t.sx = t.sy = 0.70
+        win.doc.layers.append(t)
+
+        # ---- 形状 ----
+        win.select_layer(shl.id)
+        win.set_tool("shape")
+        win.opts.set_tool("shape")
+        win.opts.combo_shape.setCurrentText("矩形")
+        win.opts.fg.set_color((228, 66, 62))
+        win.draw_shape((70, 60), (300, 250))
+        win.opts.fg.set_color((52, 108, 214))
+        win.opts.combo_shape.setCurrentText("椭圆")
+        win.draw_shape((350, 60), (600, 250))
+        win.opts.fg.set_color((46, 158, 116))
+        win.opts.chk_shape_outline.setChecked(True)
+        win.draw_shape((650, 60), (900, 250))
+        win.opts.chk_shape_outline.setChecked(False)
+
+        # ---- 纹理层：撒瑕点 -> 逐个修复 ----
+        win.select_layer(t.id)
+        lay = win.doc.find(t.id)
+        Minv = np.array([[1.0, 0.0, -t.tx], [0.0, 1.0, -t.ty]], np.float64)
+
+        spots = [(250, 400, 15), (430, 450, 12), (610, 385, 16),
+                 (790, 460, 13), (960, 405, 14), (350, 620, 12)]
+        # **只 detach 一次**：循环里反复 detach 会让 lay 变成旧引用，
+        # 写进去的像素下一次就被换掉了（踩过，纹理层最后整块透明）
+        win.doc.detach_pixels(lay)
+        lay = win.doc.find(t.id)
+        sh, sw = lay.image.shape[:2]
+        for cx, cy, rr in spots:
+            sp = _cv2.transform(np.array([[[cx, cy]]], np.float32),
+                                 Minv)[0, 0]
+            yy0, xx0 = int(sp[1]) - rr, int(sp[0]) - rr
+            if (0 <= yy0 and 0 <= xx0 and yy0 + 2 * rr <= sh
+                    and xx0 + 2 * rr <= sw):
+                lay.image[yy0:yy0 + 2 * rr, xx0:xx0 + 2 * rr, :3] = (56, 38, 32)
+
+        win.set_tool("heal")
+        win.opts.set_tool("heal")
+        win.opts.size = 50
+        win.opts.hardness = 0.5
+        win.opts.blur_strength = 1.0
+        for cx, cy, _rr in spots:
+            win.heal_at(cx, cy)
+
+        # ---- 克隆：采样左下金色，涂到右下 ----
+        win.set_tool("clone")
+        win.opts.set_tool("clone")
+        win.opts.size = 46
+        win.opts.hardness = 0.45
+        win.opts.blur_strength = 1.0
+        snap = win.clone_sample(int(W2 * 0.11), int(H2 * 0.72))
+        win.view.set_clone_source(snap)
+        for cx, cy in [(660, 640), (760, 685), (860, 640), (960, 685),
+                       (660, 760), (860, 760)]:
+            win.clone_stamp(cx, cy)
+
+        win.set_tool("picker")
+        win.opts.set_tool("picker")
+        win.panel.rebuild()
+        win.inspector.refresh()
+    elif tool == "retouch":
+        # 第十九批：修饰类工具 —— 渐变（左半）+ 局部模糊（右下）
+        from src.core.document import make_image_layer
+
+        # 场景是接着上一个跑的，上一段留下的选区 / 通道会限制这几个工具
+        # （渐变只涂选区内 -> 选区外留初始的纯黑）
+        doc.selection = None
+        win.channels.rebuild()
+        win.channels.list.clear()
+        for _c in list(doc.channels):
+            doc.channels.remove(_c)
+        doc.composite_alpha = None
+        doc.channel_view = {k: True for k in ("R", "G", "B", "A")}
+
+        base = np.zeros((doc.height, doc.width, 4), np.uint8)
+        base[..., :3] = (238, 240, 244)
+        base[..., 3] = 255
+        b = make_image_layer("底", base, doc.width, doc.height)
+        b.tx, b.ty = doc.width / 2.0, doc.height / 2.0
+        win.doc.layers.append(b)
+
+        # 渐变用的图层：左半红色 -> 蓝色
+        g = np.zeros((doc.height, doc.width, 4), np.uint8)
+        g[..., :3] = (128, 128, 128)   # 初始灰：没涂到的地方也别是纯黑
+        g[..., 3] = 255
+        gl = make_image_layer("渐变", g, doc.width, doc.height)
+        gl.tx, gl.ty = doc.width * 0.26, doc.height * 0.42
+        gl.sx = gl.sy = 0.5
+        win.doc.layers.append(gl)
+        win.select_layer(gl.id)
+        win.opts.fg.set_color((235, 62, 52))
+        win.opts.bg.set_color((28, 96, 210))
+        win.opts.grad_style = "线性"
+        win.set_tool("gradient")
+        win.opts.set_tool("gradient")
+        win.apply_gradient_drag((0, 0), (gl.image.shape[1], 0))
+
+        # 模糊用的图层：高频棋盘，模糊才有东西可压
+        # 竖条（每 28 px 一根）。**别用细棋盘**：图层缩到 0.42 之后
+        # 重采样已经把高频吃掉了，再糊也看不出差别
+        ry, rx = np.mgrid[0:doc.height, 0:doc.width]
+        strip = ((rx % 28) < 14)
+        f = np.zeros((doc.height, doc.width, 4), np.uint8)
+        f[strip, :3] = (44, 50, 62)
+        f[~strip, :3] = (238, 240, 245)
+        f[..., 3] = 255
+        fl = make_image_layer("待模糊", f, doc.width, doc.height)
+        fl.tx, fl.ty = doc.width * 0.70, doc.height * 0.66
+        fl.sx = fl.sy = 0.42
+        win.doc.layers.append(fl)
+        win.select_layer(fl.id)
+        win.set_tool("blurtool")
+        win.opts.size = 150
+        win.opts.hardness = 0.5
+        win.opts.blur_strength = 1.0
+        # 沿一条曲线抹过去，只糊中间那条，边缘保留锐利的棋盘
+        for k in range(-260, 261, 20):
+            win.blur_at(fl.tx + k, fl.ty + math.sin(k / 90.0) * 120.0)
+        win.set_tool("picker")
+        win.opts.set_tool("picker")
+        win.panel.rebuild()
+        win.inspector.refresh()
     elif tool == "channels":
         # 第十七批：通道面板 —— R/G/B/Alpha 四路 + 一个把右半边打透明的通道，
         # 顺便展示"关掉红通道显示为纸白"（左半）和通道生效（右半透明）
@@ -253,6 +488,73 @@ def main():
         win._do_render()
         win.channels.rebuild()
         win.inspector.refresh()
+    elif tool == "contentaware":
+        # 第二十二批：内容感知填充 + 画布大小
+        # 底图：木纹质感（条纹 + 噪声），中间挖一块"东西"（深色矩形），
+        # 填充后应该长出跟周围连续的纹理
+        from src.core.content_aware import fill_content_aware
+        from src.core.document import make_image_layer
+
+        doc.selection = None
+        for _c in list(doc.channels):
+            doc.channels.remove(_c)
+        doc.composite_alpha = None
+        doc.channel_view = {k: True for k in ("R", "G", "B", "A")}
+        win.channels.rebuild()
+
+        # 示例图层留着会盖住木纹底
+        doc.layers.clear()
+
+        W2, H2 = doc.width, doc.height
+        rng = np.random.default_rng(7)
+        base = np.zeros((H2, W2, 4), np.uint8)
+        # 材质要同时满足两点才看得出「内容感知」的价值：
+        # 1) **有大尺度的连续明暗**（inpaint 能沿着边缘续上）
+        # 2) **不是纯色**（纯色填充看起来一模一样，等于没演示）
+        # 这里用「斜向软斑+ 细颗粒」，斑的尺度远大于选区，
+        # 所以选区内外应该能接上同一片明暗走向。
+        yy, xx = np.mgrid[0:H2, 0:W2]
+        blobs = (np.sin((xx + 1.3 * yy) / 190.0) * 46
+                 + np.sin((xx - 0.7 * yy) / 310.0) * 30
+                 + rng.normal(0, 5, (H2, W2))).astype(float)
+        base[..., 0] = np.clip(226 + blobs, 0, 255)
+        base[..., 1] = np.clip(196 + blobs * 0.9, 0, 255)
+        base[..., 2] = np.clip(162 + blobs * 0.7, 0, 255)
+        base[..., 3] = 255
+        b = make_image_layer("木纹", base, W2, H2)
+        b.tx, b.ty = W2 / 2.0, H2 / 2.0
+        win.doc.layers.append(b)
+
+        # 挖一块不透明的东西（模拟"要去掉的照片里的人/物"）
+        hole = np.zeros((H2, W2), np.float32)
+        hx0, hy0 = int(W2 * 0.34), int(H2 * 0.30)
+        hx1, hy1 = int(W2 * 0.62), int(H2 * 0.74)
+        hole[hy0:hy1, hx0:hx1] = 1.0
+        # 物块带一点自己的明暗，否则"填充前后没有对比"看不出效果
+        obj = base.copy()
+        obj[hy0:hy1, hx0:hx1, :3] = np.array([46, 52, 70])
+        ol = make_image_layer("要去掉的物块", obj, W2, H2)
+        ol.tx, ol.ty = W2 / 2.0, H2 / 2.0
+        win.doc.layers.append(ol)
+
+        # 选区必须**先建好**再取_src_selection —— 那函数是从 doc.selection
+        # 出发做逆变换的，没有选区只会返回 None，填充静默变成空操作
+        win.doc.selection = Selection(W2, H2, (hole * 255).astype(np.uint8))
+        sel = win._src_selection(ol)
+        assert sel is not None, "选区没建好"
+        win.doc.detach_pixels(ol)
+        # 用「邻近」而不是「纹理合成」：纹理合成是按块匹配的，
+        #块内像素必须真的有变化才有意义；本例的纹理是低频的，
+        # 一个 15px 的块里几乎是常量，块匹配退化（见 HANDOFF §5.32 的已知限制）。
+        # 真实照片（草地 / 砖墙 / 碎石）下纹理合成才显出优势。
+        ol.image = fill_content_aware(ol.image, sel, mode="邻近",
+                                      feather=2.0)
+        win.commit("内容感知填充")
+        win.select_layer(ol.id)
+        win.panel.rebuild()
+        win.view.update_selection_overlay()
+        win._do_render()
+
     elif tool == "psd":
         # 第十六批：PSD 导入 —— 文字层还原成可编辑文字 + 图层样式接上
         from src.core.psd_import import load_psd
@@ -315,9 +617,9 @@ def main():
         win.select_layer(scan.id)
         win.panel.rebuild()
     elif tool in ("brushtips", "brushdlg"):
-        # 第十四批：笔刷增强 —— 铺一张"纸"，每一行用不同笔尖 / 动态参数画一道
-        import math
-
+        # 第十四批：笔刷增强 —— 铺一张「纸」，每一行用不同笔尖 / 动态参数画一道
+        # （math 用文件头那个 import；在这里再 import 一次会让整个 main 里的
+        #  math 都被判成局部变量）
         from src.core.document import Document, make_image_layer
         from src.core.paint import Stroke
 
@@ -463,6 +765,31 @@ def main():
         app.processEvents()
         app.processEvents()
         pm = bdlg.grab()
+    elif tool == "cafdlg":
+        # 第二十二批：内容感知填充对话框（切到纹理合成那一栏）
+        from src.ui.content_aware_dialog import ContentAwareDialog
+        cdlg = ContentAwareDialog(win)
+        cdlg.mode.setCurrentText("纹理合成")
+        cdlg.patch.setValue(15)
+        cdlg.feather.setValue(3)
+        cdlg.show()
+        app.processEvents()
+        app.processEvents()
+        pm = cdlg.grab()
+
+    elif tool == "canvasdlg":
+        # 第二十二批：画布大小对话框（九宫格锚点 + 边缘填充）
+        from src.ui.canvas_size_dialog import CanvasSizeDialog
+        sdlg = CanvasSizeDialog(win, win.doc)
+        sdlg.rel.setChecked(True)
+        sdlg.width.setValue(60)
+        sdlg.height.setValue(40)
+        sdlg.anchor_group.buttons()[7].setChecked(True)   # 下
+        sdlg.show()
+        app.processEvents()
+        app.processEvents()
+        pm = sdlg.grab()
+
     else:
         pm = win.grab()
     pm.save(out)

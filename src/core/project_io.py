@@ -27,14 +27,75 @@ from .layer import LAYER_SMART
 PROJECT_EXT = ".cwproj"
 
 
-def imread_rgba(path):
-    """读取图片为 (h,w,4) uint8 RGBA。支持中文路径。"""
+SVG_EXT = ".svg"
+HEIF_EXT = (".heic", ".heif")
+
+_HEIF_OK = None
+
+
+def _require_heif():
+    """HEIC / HEIF 交给 pillow-heif 解码，注册一次即全局生效。"""
+    global _HEIF_OK
+    if _HEIF_OK is None:
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+            _HEIF_OK = True
+        except Exception:
+            _HEIF_OK = False
+    if not _HEIF_OK:
+        raise RuntimeError(
+            "读取 HEIC 需要 pillow-heif：\n\n"
+            "  pip install pillow-heif "
+            "-i https://mirrors.aliyun.com/pypi/simple\n\n"
+            "装完重启程序即可。")
+    return True
+
+
+def _to_rgba(im):
+    """PIL 图 → RGBA。HEIC 常见 I;16 / CMYK / 灰度，直接 convert 会崩。"""
+    if im.mode == "RGBA":
+        return im
+    arr = np.array(im)
+    if arr.dtype == np.uint8:
+        return im.convert("RGBA")
+    if arr.dtype == np.uint16:                     # 16-bit（HEIC / TIFF）
+        arr = (arr >> 8).astype(np.uint8)
+    else:                                          # I / F 这类浮点整数模式
+        arr = np.clip(np.nan_to_num(arr.astype(np.float32)) * 255.0,
+                      0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        return Image.fromarray(arr, "L").convert("RGBA")
+    if arr.shape[2] == 4:
+        return Image.fromarray(arr, "RGBA")
+    return Image.fromarray(arr[:, :, :3], "RGB").convert("RGBA")
+
+
+def imread_rgba(path, target=None):
+    """读取图片为 (h,w,4) uint8 RGBA。支持中文路径。
+
+    `target=(w, h)` 是**输出尺寸**，只对 SVG 有意义 —— 矢量图没有固有分辨率，
+    target 缺省时按 SVG 自身的 width/height（没有就按 viewBox 比例）。位图
+    永远按原始分辨率读，target 会被忽略。
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == SVG_EXT:
+        from .svg_import import render_svg, svg_size
+        w = h = None
+        if target:
+            w, h = target[0], target[1]
+        if not w or not h:
+            sw, sh = svg_size(path)
+            w = w or sw
+            h = h or sh
+        return render_svg(path, w, h)
+    if ext in HEIF_EXT:
+        _require_heif()
     with open(path, "rb") as f:
         data = f.read()
     im = Image.open(io.BytesIO(data))
     im = _apply_exif_orientation(im)
-    if im.mode != "RGBA":
-        im = im.convert("RGBA")
+    im = _to_rgba(im)
     return np.array(im)
 
 
