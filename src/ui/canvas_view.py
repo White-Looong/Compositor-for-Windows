@@ -12,19 +12,23 @@
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import (QBrush, QColor, QImage, QPainter, QPainterPath,
-                           QPen, QPixmap, QPolygonF, QTransform)
-from PySide6.QtWidgets import (QGraphicsEllipseItem, QGraphicsPathItem,
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter,
+                           QPainterPath, QPen, QPixmap, QPolygonF,
+                           QTextBlockFormat, QTextCursor, QTransform)
+from PySide6.QtWidgets import (QFrame, QGraphicsEllipseItem, QGraphicsPathItem,
                                QGraphicsPixmapItem, QGraphicsPolygonItem,
                                QGraphicsRectItem, QGraphicsScene,
-                               QGraphicsView)
+                               QGraphicsView, QPlainTextEdit)
 
+from ..core import quick_mask
 from ..core.effects import effect_padding
-from ..core.paint import Stroke
+from ..core.paint import Stroke, _gray
 from ..core.selection import (ADD, INTERSECT, REPLACE, SUBTRACT, Selection)
+from . import brush_dialog
 from .tool_options import PAINT_TOOLS, SELECT_TOOLS
 
 # 手柄定义: 名称 -> (锚点在图像中心坐标中的符号, 固定点符号, 影响 x/y)
@@ -93,9 +97,19 @@ class CanvasView(QGraphicsView):
         self._sel_drag = None
         self._poly_pts = []
         self._dash = 0.0
+        self._qm_tick = 0.0           # 快速蒙版红罩的刷新节流时间戳
 
         # 绘制相关
         self._stroke = None
+        # 画布内编辑文字（Ctrl+T）：叠在 viewport 上的输入框
+        self._text_edit = None
+        self._text_edit_layer = None
+        self._text_edit_style = None
+        self._text_edit_busy = False     # 行高 merge 期间挡住重入
+        # 喷枪：按住不动也要补笔，所以得有个自己的定时器
+        self._air_timer = QTimer(self)
+        self._air_timer.setSingleShot(False)
+        self._air_timer.timeout.connect(self._airbrush_tick)
 
         self.scene = CanvasScene(self)
         self.setScene(self.scene)
@@ -115,6 +129,10 @@ class CanvasView(QGraphicsView):
         self.border_item.setZValue(5)
         self.border_item.setPen(QPen(QColor(120, 120, 125), 0))
         self.scene.addItem(self.border_item)
+
+        # 快速蒙版：半透明红罩（盖在未选中 / 选中的那一侧，见 core/quick_mask.py）
+        self.qm_fill = self.scene.addPixmap(QPixmap())
+        self.qm_fill.setZValue(7)
 
         # 选区：半透明蓝底 + 黑白双虚线（在任何底上都看得见）
         self.sel_fill = self.scene.addPixmap(QPixmap())
@@ -191,6 +209,7 @@ class CanvasView(QGraphicsView):
         self.setTransform(self._make_transform())
         self._update_handles()
         self.update_selection_overlay()
+        self._place_text_edit()
         self.transformChanged.emit()
 
     def _make_transform(self):
@@ -218,6 +237,14 @@ class CanvasView(QGraphicsView):
         return doc.selection if doc else None
 
     def update_selection_overlay(self):
+        if quick_mask.is_on(self.main.doc):
+            # 快速蒙版模式下选区用红罩表示，蚂蚁线不画（PS 也是这样）
+            self.sel_fill.setPixmap(QPixmap())
+            self.sel_dark.setPath(QPainterPath())
+            self.sel_light.setPath(QPainterPath())
+            self._update_quick_mask_overlay()
+            return
+        self.qm_fill.setPixmap(QPixmap())
         sel = self.active_selection()
         if sel is None or sel.is_empty:
             self.sel_fill.setPixmap(QPixmap())
@@ -246,6 +273,22 @@ class CanvasView(QGraphicsView):
         self.sel_dark.setPath(path)
         self.sel_light.setPath(path)
         self._tick_ants()
+
+    def _update_quick_mask_overlay(self):
+        """快速蒙版的红罩：alpha 由 core/quick_mask.overlay_alpha 算。"""
+        doc = self.main.doc
+        a = quick_mask.overlay_alpha(doc)
+        if a is None:
+            self.qm_fill.setPixmap(QPixmap())
+            return
+        h, w = a.shape[:2]
+        arr = np.zeros((h, w, 4), np.uint8)
+        arr[..., 0] = 255
+        arr[..., 3] = a
+        arr = np.ascontiguousarray(arr)
+        self._qm_buf = arr
+        img = QImage(arr.data, w, h, 4 * w, QImage.Format_RGBA8888)
+        self.qm_fill.setPixmap(QPixmap.fromImage(img))
 
     def _tick_ants(self):
         if self.sel_dark.path().isEmpty():
@@ -300,8 +343,20 @@ class CanvasView(QGraphicsView):
         d = ROT_DIST / self.zoom
         return pts, QPointF(mx + ux * d, my + uy * d)
 
+    def _handle_layer(self):
+        """手柄挂在哪一层上。
+
+        有浮动层时挂**浮动层** —— 浮起来的那块内容也可以直接拖手柄缩放 /
+        旋转，不用先落定。没有浮动层时才是当前选中图层。
+        """
+        doc = self.main.doc
+        if doc is not None and doc.float_layer is not None \
+                and self.tool == "move":
+            return doc.float_layer
+        return self.main.selected_layer()
+
     def _update_handles(self):
-        layer = self.main.selected_layer()
+        layer = self._handle_layer()
         show = layer is not None and not layer.locked and self.tool in (
             "move", "")
         for it in self.handles.values():
@@ -358,7 +413,7 @@ class CanvasView(QGraphicsView):
             self.brush_ring.setVisible(False)
 
     def _hit_handle(self, scene_pos):
-        layer = self.main.selected_layer()
+        layer = self._handle_layer()
         if layer is None or self.tool != "move":
             return None
         tol = 7.0 / self.zoom
@@ -459,8 +514,166 @@ class CanvasView(QGraphicsView):
         self._preview_sel = None
         self.update_selection_overlay()
 
+    # ================= 画布内编辑文字（Ctrl+T） =================
+
+    # 字号必须写进**控件自己的样式表**：主窗口那份 `QWidget{font-size:12px}`
+    # 优先级高于 setFont()，只用 setFont 的话字永远是最小号（踩过，见 §4.3 第 27 条）
+    EDIT_STYLE = ("QPlainTextEdit{background: rgba(122,162,247,28);"
+                  " border: 1px dashed #7aa2f7; color: #f0f0f0;"
+                  " padding: 2px; font-family: %s; font-size: %dpx;"
+                  " %s %s}")
+
+    def begin_text_edit(self, layer):
+        """在选中的文字图层上叠一个输入框，边打边看。
+
+        只改 `layer.text["content"]`（非破坏性），文字依旧可以再改 / 再换字体。
+        Esc、点到别处、换工具都会收起来。
+        """
+        if layer is None or not layer.is_text or layer.text is None:
+            return False
+        self.end_text_edit()
+        ed = QPlainTextEdit(self.viewport())
+        ed.setPlainText(str(layer.text.get("content", "")))
+        ed.setFrameShape(QFrame.NoFrame)
+        ed.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        ed.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        ed.textChanged.connect(self._on_text_edit_changed)
+        ed.installEventFilter(self)
+        self._text_edit = ed
+        self._text_edit_layer = layer
+        self._text_edit_style = None
+        self._text_edit_busy = False
+        self._place_text_edit()
+        ed.show()
+        ed.setFocus()
+        ed.selectAll()
+        return True
+
+    def edit_text_layer(self):
+        """正在画布上编辑的那个文字图层（没在编辑就返回 None）。"""
+        return self._text_edit_layer if self._text_edit is not None else None
+
+    def end_text_edit(self):
+        """收起输入框（内容已经实时写进图层了，这里只收尾）。"""
+        ed = self._text_edit
+        self._text_edit = None
+        self._text_edit_layer = None
+        self._text_edit_style = None
+        if ed is None:
+            return False
+        try:
+            ed.textChanged.disconnect(self._on_text_edit_changed)
+        except (RuntimeError, TypeError):
+            pass
+        ed.removeEventFilter(self)
+        ed.hide()
+        ed.deleteLater()
+        self.setFocus()
+        return True
+
+    def _on_text_edit_changed(self):
+        layer = self._text_edit_layer
+        if layer is None or self._text_edit is None or self._text_edit_busy:
+            return
+        # 编辑期间换了选中图层就收起来 —— 否则输入的内容会被写进另一个图层
+        if self.main.selected_layer() is not layer:
+            self.end_text_edit()
+            return
+        self._apply_edit_line_height()
+        self.main.set_text_param("content", self._text_edit.toPlainText())
+
+    def _place_text_edit(self):
+        """把输入框摆到文字图层在屏幕上的位置，字号也跟着缩放。"""
+        ed = self._text_edit
+        layer = self._text_edit_layer
+        if ed is None or layer is None:
+            return
+        c = layer.corners()
+        if c is None:
+            return
+        xs = [self.mapFromScene(QPointF(float(x), float(y))).x() for x, y in c]
+        ys = [self.mapFromScene(QPointF(float(x), float(y))).y() for x, y in c]
+        x0, y0 = min(xs) - 4.0, min(ys) - 4.0
+        w = max(max(xs) - min(xs) + 8.0, 220.0)
+        h = max(max(ys) - min(ys) + 8.0, 60.0)
+        ed.setGeometry(int(round(x0)), int(round(y0)),
+                       int(round(w)), int(round(h)))
+        fam = str(layer.text.get("family") or "").strip()
+        px = int(max(8, min(300, round(
+            float(layer.text.get("size", 96.0)) * self.zoom))))
+        css_fam = '"%s"' % fam if fam else '"Microsoft YaHei UI", "Segoe UI"'
+        style = self.EDIT_STYLE % (
+            css_fam, px,
+            "font-weight:600;" if layer.text.get("bold") else "",
+            "font-style:italic;" if layer.text.get("italic") else "")
+        if style != self._text_edit_style:      # 一样就别重复设，省一次样式重算
+            ed.setStyleSheet(style)
+            self._text_edit_style = style
+        f = QFont()
+        if fam:
+            f.setFamily(fam)
+        f.setPixelSize(px)
+        f.setBold(bool(layer.text.get("bold")))
+        f.setItalic(bool(layer.text.get("italic")))
+        ed.setFont(f)
+        self._apply_edit_line_height()
+
+    def _apply_edit_line_height(self):
+        """让输入框的行距跟文字图层的 line_height 一致，才像"写在画布上"。
+
+        行距不是 CSS 能设的东西，只能用块格式（比例行高）。每次改内容后
+        新块会退回默认值，所以要在内容变化时重来一遍。
+
+        注意：mergeBlockFormat() 自己会再发一次 textChanged，不挡住就会
+        无限递归（踩过，见 §4.3 第 27 条）。
+        """
+        ed = self._text_edit
+        if ed is None or self._text_edit_layer is None or self._text_edit_busy:
+            return
+        try:
+            lh = float(self._text_edit_layer.text.get("line_height", 1.2))
+        except (TypeError, ValueError):
+            lh = 1.2
+        fmt = QTextBlockFormat()
+        # 注意：PySide6 这里要的是 int 而不是枚举对象本身
+        fmt.setLineHeight(max(50.0, min(500.0, lh * 100.0)),
+                          int(QTextBlockFormat.ProportionalHeight.value))
+        self._text_edit_busy = True
+        try:
+            cur = ed.textCursor()
+            cur.select(QTextCursor.Document)
+            cur.mergeBlockFormat(fmt)
+            cur.clearSelection()
+            ed.setTextCursor(cur)
+        finally:
+            self._text_edit_busy = False
+
+    def eventFilter(self, obj, event):
+        """输入框里按 Esc / 失去焦点就收起来。"""
+        if obj is self._text_edit:
+            et = event.type()
+            if et == QEvent.Type.KeyPress and event.key() == Qt.Key_Escape:
+                self.end_text_edit()
+                return True
+            if et == QEvent.Type.FocusOut:
+                self.end_text_edit()
+                return False
+        return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place_text_edit()
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        self._place_text_edit()
+
     def cancel_operation(self):
         """Esc：取消进行中的套索/多边形/选区。"""
+        if self.end_text_edit():
+            return True
+        if self._stroke is not None:
+            self._air_timer.stop()
         if self._drag is not None:
             self._drag = None
             self.main.set_interactive(False)
@@ -489,6 +702,26 @@ class CanvasView(QGraphicsView):
     # ================= 绘制 =================
 
     def _start_paint(self, p, modifiers):
+        doc = self.main.doc
+        if doc is not None and quick_mask.is_on(doc):
+            # 快速蒙版模式：画笔涂的就是那张遮罩，跟图层没关系。
+            # 黑 = 排除出选区，白 = 纳入选区，灰 = 半选中
+            opts = self.main.opts
+            gray = int(round(_gray(opts.fg.rgb() if self.tool == "brush"
+                                   else opts.bg.rgb())))
+            st = Stroke(doc=doc, layer=None, tool="brush",
+                        size=opts.size, hardness=opts.hardness,
+                        opacity=opts.opacity, flow=opts.flow,
+                        smoothing=opts.smoothing, target="quick",
+                        color=(gray, gray, gray),
+                        **brush_dialog.stroke_kwargs(opts.brush))
+            if not st.begin((p.x(), p.y())):
+                return False
+            self._stroke = st
+            self._start_airbrush(st)
+            self.main.request_render()
+            return True
+
         layer = self.main.selected_layer()
         if layer is None:
             self.statusMessage.emit("先选中一个位图图层再画")
@@ -524,13 +757,40 @@ class CanvasView(QGraphicsView):
                     size=opts.size, hardness=opts.hardness,
                     opacity=opts.opacity, flow=opts.flow,
                     smoothing=opts.smoothing, target=target,
-                    color=opts.fg.rgb())
+                    color=opts.fg.rgb(),
+                    **brush_dialog.stroke_kwargs(opts.brush))
         if not st.begin((p.x(), p.y())):
             self.statusMessage.emit("无法在该图层绘制")
             return False
         self._stroke = st
+        self._start_airbrush(st)
         self.main.request_render()
         return True
+
+    # ---------- 喷枪 ----------
+
+    def _start_airbrush(self, st):
+        """喷枪开启时，按住不动也要按固定频率补笔（PS 的喷枪就是这样）。"""
+        self._air_timer.stop()
+        if not getattr(st, "airbrush", False):
+            return
+        rate = float((self.main.opts.brush or {}).get("air_rate", 12.0))
+        self._air_timer.start(int(max(16, round(1000.0 / max(1.0, rate)))))
+
+    def _airbrush_tick(self):
+        st = self._stroke
+        if st is None:
+            self._air_timer.stop()
+            return
+        d = st.airbrush_tick()
+        if d is None:
+            return
+        if st.target == "quick":
+            self.update_selection_overlay()
+        else:
+            layer = self.main.selected_layer()
+            pad = int(effect_padding(layer.effects)) + 2 if layer else 2
+            self.main.request_render(st.take_dirty(pad))
 
     # ================= 局部重渲染（脏矩形） =================
 
@@ -660,9 +920,12 @@ class CanvasView(QGraphicsView):
         p = self.mapToScene(event.position().toPoint())
         t = self.tool
 
-        # 建新选区 = 放弃浮动状态，先把浮动内容盖回去
+        # 建新选区 = 放弃浮动状态，先把浮动内容盖回去；
+        # 在快速蒙版模式下画选框等于"退出快速蒙版，重新选"
         if t in ("rect", "ellipse", "lasso", "polygon", "magic"):
             self.main.stamp_float(silent=True)
+            if quick_mask.is_on(self.main.doc):
+                self.main.toggle_quick_mask()
 
         if t in PAINT_TOOLS:
             self._start_paint(p, event.modifiers())
@@ -692,16 +955,17 @@ class CanvasView(QGraphicsView):
             return
 
         # ---- 移动/变换工具 ----
-        layer = self.main.selected_layer()
+        layer = self._handle_layer()      # 有浮动层时手柄是它的
         if layer is None or layer.locked:
             super().mousePressEvent(event)
             return
         role = self._hit_handle(p)
         if role:
-            self._drag = {"role": role, "start": p, "layer": layer,
-                          "sx": layer.sx, "sy": layer.sy, "rot": layer.rot,
-                          "tx": layer.tx, "ty": layer.ty,
-                          "a0": math.atan2(p.y() - layer.ty, p.x() - layer.tx),
+            hl = self._handle_layer()      # 有浮动层时手柄是它的
+            self._drag = {"role": role, "start": p, "layer": hl,
+                          "sx": hl.sx, "sy": hl.sy, "rot": hl.rot,
+                          "tx": hl.tx, "ty": hl.ty,
+                          "a0": math.atan2(p.y() - hl.ty, p.x() - hl.tx),
                           "moved": False}
             self.main.set_interactive(True)     # 大画布上改走低分辨率代理
             event.accept()
@@ -734,10 +998,19 @@ class CanvasView(QGraphicsView):
 
         if self._stroke is not None:
             self._stroke.extend((p.x(), p.y()))
-            # 只重算这一笔抹过的那一小块（图层样式要往外画，留够外扩）
-            layer = self.main.selected_layer()
-            pad = int(effect_padding(layer.effects)) + 2 if layer else 2
-            self.main.request_render(self._stroke.take_dirty(pad))
+            if self._stroke.target == "quick":
+                # 快速蒙版不是图层像素，不必重渲染，只刷红罩。
+                # 限流：每帧重建整张 12 MP 的 RGBA 太贵，8 fps 够看了
+                self._stroke.take_dirty(0)
+                now = time.perf_counter()
+                if now - self._qm_tick > 0.12:
+                    self._qm_tick = now
+                    self.update_selection_overlay()
+            else:
+                # 只重算这一笔抹过的那一小块（图层样式要往外画，留够外扩）
+                layer = self.main.selected_layer()
+                pad = int(effect_padding(layer.effects)) + 2 if layer else 2
+                self.main.request_render(self._stroke.take_dirty(pad))
             self._update_brush_ring(p)
             event.accept()
             return
@@ -789,7 +1062,7 @@ class CanvasView(QGraphicsView):
             return
 
         # 仅更新光标
-        layer = self.main.selected_layer()
+        layer = self._handle_layer()
         role = self._hit_handle(p) if layer else None
         cursors = {
             "nw": Qt.SizeFDiagCursor, "se": Qt.SizeFDiagCursor,
@@ -815,9 +1088,15 @@ class CanvasView(QGraphicsView):
             return
 
         if self._stroke is not None:
+            quick = self._stroke.target == "quick"
+            self._air_timer.stop()
             self._stroke.end()
             self._stroke = None
-            self.main.after_pixel_edit()
+            if quick:
+                self.main.commit("编辑快速蒙版")
+                self.update_selection_overlay()
+            else:
+                self.main.after_pixel_edit()
             event.accept()
             return
 
@@ -929,24 +1208,30 @@ class CanvasView(QGraphicsView):
             new_sx = d["sx"] * r
             new_sy = d["sy"] * r
 
-        # 保持对角（固定点）不动
-        c, s = c0, s0
-        fix_x, fix_y = f[0] * hw, f[1] * hh
-        ox = d["sx"] * fx * fix_x
-        oy = d["sy"] * fy * fix_y
-        px = d["tx"] + ox * c - oy * s
-        py = d["ty"] + ox * s + oy * c
+        if modifiers & Qt.AltModifier:
+            # Alt = 以中心为基准缩放（PS 里 Alt 拖手柄就是两边一起长）
+            layer.tx = d["tx"]
+            layer.ty = d["ty"]
+        else:
+            # 保持对角（固定点）不动
+            c, s = c0, s0
+            fix_x, fix_y = f[0] * hw, f[1] * hh
+            ox = d["sx"] * fx * fix_x
+            oy = d["sy"] * fy * fix_y
+            px = d["tx"] + ox * c - oy * s
+            py = d["ty"] + ox * s + oy * c
 
-        nx = new_sx * fx * fix_x
-        ny = new_sy * fy * fix_y
-        layer.tx = px - (nx * c - ny * s)
-        layer.ty = py - (nx * s + ny * c)
+            nx = new_sx * fx * fix_x
+            ny = new_sy * fy * fix_y
+            layer.tx = px - (nx * c - ny * s)
+            layer.ty = py - (nx * s + ny * c)
         layer.sx = new_sx
         layer.sy = new_sy
 
         self._render_moved(before, layer)
         self._update_handles()
-        self.main.refresh_inspector()
+        if layer is not getattr(self.main.doc, "float_layer", None):
+            self.main.refresh_inspector()
         self.statusMessage.emit("缩放: %.1f%% x %.1f%%" %
                                 (layer.sx * 100, layer.sy * 100))
 

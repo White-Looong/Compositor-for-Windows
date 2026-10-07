@@ -5,21 +5,24 @@
 所以新增一种调整只要写函数 + 参数表，不用碰这里的界面代码。
 
 三块东西：
-  * HistogramView —— 合成结果的直方图（色阶 / 曲线 / 曝光用它取参考）
-  * CurveEditor   —— 可拖控制点的曲线编辑器，单调三次插值，不过冲
-  * AdjustPanel   —— 把 Spec 渲染成一行行控件
+  * HistogramView   —— 合成结果的直方图（色阶 / 曲线 / 曝光用它取参考）
+  * CurveEditor     —— 可拖控制点的曲线编辑器，单调三次插值，不过冲
+  * GradientEditor  —— 可拖控制点的渐变条（渐变映射用）
+  * AdjustPanel     —— 把 Spec 渲染成一行行控件
 """
 
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPolygonF
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (QBrush, QColor, QLinearGradient, QPainter, QPen,
+                           QPolygonF)
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox,
                                QFormLayout, QHBoxLayout, QLabel, QPushButton,
                                QSlider, QVBoxLayout, QWidget)
 
-from ..core.adjust import ADJUSTMENTS, curve_lut, default_params
+from ..core.adjust import (ADJUSTMENTS, curve_lut, default_params,
+                           gradient_lut, legacy_stops, normalize_stops)
 
 CHANNELS = ["RGB", "R", "G", "B"]
 
@@ -235,6 +238,166 @@ class CurveEditor(QWidget):
         self.pointsChanged.emit([list(q) for q in self.points])
 
 
+# ---------------------------------------------------------------- 渐变编辑器
+
+class GradientEditor(QWidget):
+    """渐变条编辑器。值是控制点列表 ``[[位置 0~1, r, g, b], ...]``。
+
+    交互：拖控制点改位置 · 空白处单击加一个点 · 双击控制点改颜色 ·
+    把非端点的控制点**往下拖出控件**就删掉。
+
+    位置允许互相越过（越过之后内部会重排），两端点不能删。
+    """
+
+    gradientChanged = Signal(object)
+
+    _PAD = 8
+    _BAR_TOP = 6
+    _BAR_H = 24
+    _DRAG_OUT = 20
+
+    def __init__(self, stops=None, width=176):
+        super().__init__()
+        self.setFixedHeight(self._BAR_TOP + self._BAR_H + 20)
+        self.setMinimumWidth(width)
+        self.setMouseTracking(True)
+        self.setToolTip("拖动控制点改位置 · 单击空白加点 · 双击改颜色 · "
+                        "往下拖出控件删点")
+        self._stops = normalize_stops(stops)
+        self._drag = -1
+        self._sel = 0
+
+    # ---------- 数据 ----------
+
+    def stops(self):
+        return [list(s) for s in self._stops]
+
+    def set_stops(self, stops):
+        self._stops = normalize_stops(stops)
+        self._sel = min(self._sel, len(self._stops) - 1)
+        self.update()
+
+    # ---------- 坐标 ----------
+
+    def _x0(self):
+        return float(self._PAD)
+
+    def _bar_w(self):
+        return float(max(1, self.width() - 2 * self._PAD))
+
+    def _to_px(self, pos):
+        return self._x0() + pos * self._bar_w()
+
+    def _from_px(self, x):
+        return min(1.0, max(0.0, (x - self._x0()) / self._bar_w()))
+
+    def _handle_cy(self):
+        return float(self._BAR_TOP + self._BAR_H + 10)
+
+    def _color_at(self, pos):
+        lut = gradient_lut(self._stops, 256)
+        k = int(round(min(1.0, max(0.0, pos)) * 255.0))
+        return [int(round(v * 255.0)) for v in lut[k]]
+
+    # ---------- 绘制 ----------
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        x0, w = self._x0(), self._bar_w()
+        y0, h = float(self._BAR_TOP), float(self._BAR_H)
+        rect = QRectF(x0, y0, w, h)
+        p.fillRect(rect, QColor("#3a3a3d"))
+        grad = QLinearGradient(x0, 0.0, x0 + w, 0.0)
+        for s in self._stops:
+            grad.setColorAt(min(1.0, max(0.0, s[0])),
+                            QColor(int(s[1]), int(s[2]), int(s[3])))
+        p.fillRect(rect, QBrush(grad))
+        p.setPen(QPen(QColor("#9a9a9e"), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(rect)
+
+        cy = self._handle_cy()
+        for i, s in enumerate(self._stops):
+            px = self._to_px(s[0])
+            tri = QPolygonF([QPointF(px, cy - 8.0), QPointF(px + 5.5, cy),
+                             QPointF(px - 5.5, cy)])
+            p.setBrush(QBrush(QColor(int(s[1]), int(s[2]), int(s[3]))))
+            p.setPen(QPen(QColor("#1e1e22") if i != self._sel
+                          else QColor("#2d6db5"),
+                          2.0 if i == self._sel else 1.0))
+            p.drawPolygon(tri)
+        p.end()
+
+    # ---------- 交互 ----------
+
+    def _nearest(self, x):
+        best, bi = 8.0, -1
+        for i, s in enumerate(self._stops):
+            d = abs(self._to_px(s[0]) - x)
+            if d < best:
+                best, bi = d, i
+        return bi
+
+    def _emit(self):
+        self.gradientChanged.emit(self.stops())
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return
+        x = e.position().x()
+        i = self._nearest(x)
+        if i < 0:
+            pos = self._from_px(x)
+            self._stops.append([pos] + self._color_at(pos))
+            self._stops.sort(key=lambda q: q[0])
+            cur = [q for q in self._stops if abs(q[0] - pos) < 1e-9]
+            i = next((j for j, q in enumerate(self._stops) if q is cur[0]), 0)
+        self._sel = i
+        self._drag = i
+        self.update()
+        self._emit()
+
+    def mouseMoveEvent(self, e):
+        if self._drag < 0:
+            return
+        pos = e.position()
+        if (pos.y() > self._handle_cy() + self._DRAG_OUT and
+                0 < self._drag < len(self._stops) - 1):
+            self._stops.pop(self._drag)
+            self._drag = -1
+            self._sel = min(self._sel, len(self._stops) - 1)
+            self.update()
+            self._emit()
+            return
+        cur = self._stops[self._drag]
+        cur[0] = self._from_px(pos.x())
+        self._stops.sort(key=lambda q: q[0])       # 允许越过相邻点
+        self._drag = next(j for j, q in enumerate(self._stops) if q is cur)
+        self._sel = self._drag
+        self.update()
+        self._emit()
+
+    def mouseReleaseEvent(self, _e):
+        self._drag = -1
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return
+        i = self._nearest(e.position().x())
+        if i < 0:
+            return
+        s = self._stops[i]
+        c = QColorDialog.getColor(QColor(int(s[1]), int(s[2]), int(s[3])),
+                                  self, "控制点颜色")
+        if not c.isValid():
+            return
+        s[1], s[2], s[3] = c.red(), c.green(), c.blue()
+        self._sel = i
+        self.update()
+        self._emit()
+
+
 # ---------------------------------------------------------------- 面板
 
 class AdjustPanel(QWidget):
@@ -242,6 +405,8 @@ class AdjustPanel(QWidget):
         super().__init__()
         self.main = main
         self._sync = False
+        # 当前面板上那个「预设」下拉框（黑白用），改别的参数时要把它打回「自定义」
+        self._preset_combo = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -294,6 +459,7 @@ class AdjustPanel(QWidget):
         self._clear_form()
         if spec is None:
             return
+        self._preset_combo = None
         params = layer.adjust.setdefault("params", {})
         if not params:
             params.update(default_params(spec.key))
@@ -386,13 +552,22 @@ class AdjustPanel(QWidget):
         if prm.kind == "keyed":
             return self._keyed_row(prm, value)
 
+        if prm.kind == "gradient":
+            return self._gradient_row(prm, value, layer)
+
         if prm.kind == "choice":
             combo = QComboBox()
             combo.addItems(prm.choices)
             if value in prm.choices:
                 combo.setCurrentText(value)
-            combo.currentTextChanged.connect(
-                lambda v, k=prm.key: self._set(k, v))
+            if prm.preset_map:
+                # 预设：选中一项就把映射里的若干参数一起写进去
+                self._preset_combo = combo
+                combo.currentTextChanged.connect(
+                    lambda name, k=prm.key: self._apply_preset(k, name))
+            else:
+                combo.currentTextChanged.connect(
+                    lambda v, k=prm.key: self._set(k, v))
             return combo
 
         if prm.kind == "curve":
@@ -482,6 +657,59 @@ class AdjustPanel(QWidget):
         load(prm.keys[0] if prm.keys else "")
         return box
 
+    def _gradient_row(self, prm, value, layer):
+        """渐变条：值是控制点列表；旧工程只有 low / mid / high，在这里升级。"""
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+
+        params = layer.adjust.setdefault("params", {})
+        init = value
+        if not init and any(k in params for k in ("low", "mid", "high")):
+            init = legacy_stops(params)          # 保住旧工程自定义的三个颜色
+        editor = GradientEditor(init, width=176)
+        hint = QLabel("单击加点 · 双击改色 · 往下拖删点")
+        hint.setStyleSheet("color:#888;font-size:11px;")
+        v.addWidget(editor)
+        v.addWidget(hint)
+
+        def on_grad(stops):
+            if self._sync:
+                return
+            lay = self.main.selected_layer()
+            if lay is None or not lay.is_adjustment:
+                return
+            lay.adjust.setdefault("params", {})[prm.key] = [
+                list(s) for s in stops]
+            self._changed()
+
+        editor.gradientChanged.connect(on_grad)
+        if not value or ("stops" not in params and init):
+            # 把补出来的控制点写回参数：省得渲染每帧都走旧格式兜底
+            # （这一步不触发重渲染，因为写进去的值与当前观感完全等价）
+            params[prm.key] = editor.stops()
+        return box
+
+    def _apply_preset(self, key, name):
+        """预设下拉框：把 preset_map 里的若干参数一起写进当前调整层。"""
+        if self._sync:
+            return
+        layer = self.main.selected_layer()
+        if layer is None or not layer.is_adjustment:
+            return
+        spec = ADJUSTMENTS.get(layer.adjustment_key())
+        prm = next((q for q in (spec.params if spec else []) if q.key == key),
+                   None)
+        vals = (prm.preset_map.get(name) if prm is not None else None) or {}
+        params = layer.adjust.setdefault("params", {})
+        params[key] = name
+        params.update(dict(vals))
+        self._changed()
+        # 同一预设要带动六条滑块，整体重建一次最省事；不能同步做，
+        # 因为此刻正处在 combo 自己的信号回调里，重建会把它删掉
+        QTimer.singleShot(0, self.refresh)
+
     # ---------- 写回 ----------
 
     def _set(self, key, value):
@@ -490,7 +718,19 @@ class AdjustPanel(QWidget):
         layer = self.main.selected_layer()
         if layer is None or not layer.is_adjustment:
             return
-        layer.adjust.setdefault("params", {})[key] = value
+        params = layer.adjust.setdefault("params", {})
+        params[key] = value
+        # 有「预设」下拉框的调整（黑白）：手动改任何别的参数都算已经偏离预设
+        spec = ADJUSTMENTS.get(layer.adjustment_key())
+        for prm in (spec.params if spec else []):
+            if not prm.preset_map or prm.key == key or not prm.choices:
+                continue
+            if params.get(prm.key) != prm.choices[0]:
+                params[prm.key] = prm.choices[0]
+                if self._preset_combo is not None:
+                    blocked = self._preset_combo.blockSignals(True)
+                    self._preset_combo.setCurrentIndex(0)
+                    self._preset_combo.blockSignals(blocked)
         self._changed()
 
     def _changed(self):

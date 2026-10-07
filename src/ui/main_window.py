@@ -28,7 +28,10 @@ from ..core.layer import LAYER_IMAGE
 from ..core.paint import _gray
 from ..core.project_io import (PROJECT_EXT, export_flat, imread_rgba,
                                load_project, save_project)
-from ..core.psd_import import PSD_EXT, is_available as psd_available, load_psd
+from ..core import quick_mask
+from ..core import channels as _ch
+from ..core.psd_import import (PSD_EXT, STATS, is_available as psd_available,
+                               load_psd)
 from ..core.render import (clear_proxy_cache, has_dissolve, max_effect_padding,
                            render_document, render_from_snapshot,
                            render_proxy, render_region_tiled, render_tiled)
@@ -39,6 +42,7 @@ from ..core.smart import (content_instances, convert_to_smart, new_filter,
 from ..core.text import sync_text_image
 from .canvas_view import CanvasView
 from .filter_dialog import FilterDialog
+from .channels_panel import ROLE_MASK as _CH_ROLE_MASK, ChannelsPanel
 from .inspector import Inspector
 from .layers_panel import LayersPanel
 from .tool_options import ToolOptions
@@ -87,6 +91,13 @@ PROXY_MIN_SCALE = 0.15     # 代理最小缩放（再小就糊得看不出在拖
 PROXY_IDLE_MS = 350        # 交互停手多久之后补一张全分辨率
 PARTIAL_AREA_MAX = 0.6     # 脏区超过画布这个比例，直接整幅重算更划算
 TILE_MIN_AREA = 6_000_000  # 画布超过 6 MP 才分块：小画布省下的内存抵不上瓦片开销
+DIRTY_MAX_RECTS = 8        # 脏区最多记这么多块，超了就折叠成并集（见 mark_dirty）
+
+
+def _union(rects):
+    """一组矩形的并集包围盒。"""
+    return (min(r[0] for r in rects), min(r[1] for r in rects),
+            max(r[2] for r in rects), max(r[3] for r in rects))
 TILE_EDGE = 1024           # 瓦片边长（画布像素）。实测 24 MP：1920 MB -> 357 MB，+30% 耗时
 
 IMG_FILTER = "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff);;所有文件 (*.*)"
@@ -133,7 +144,7 @@ class MainWindow(QMainWindow):
         self._last_arr = None
         self._arr_valid = False
         self._full_dirty = True       # 整幅都要重算
-        self._dirty = None            # 否则：待重算的小区域 (x0,y0,x1,y1)
+        self._dirty = None            # 否则：待重算的区域，单个矩形或矩形列表
         self._last_pass = ""          # 上次走的哪条路：full / partial / proxy
         self._render_ms = 0.0         # 上次全量渲染耗时，用来决定要不要走代理
         self._adjust_ms = 0.0         # 上次快路径的耗时（决定它够不够代替代理）
@@ -181,6 +192,19 @@ class MainWindow(QMainWindow):
         self.inspector_dock = dock2
         # 属性面板里要放得下曲线编辑器 + 直方图，所以下半区留宽一点
         self.resizeDocks([dock, dock2], [420, 500], Qt.Vertical)
+
+        # 通道面板：与图层面板、属性面板同一个停靠区（Photoshop 也是三栏）
+        self.channels = ChannelsPanel(self)
+        self.channels.loadRequested.connect(self.load_channel_selection)
+        self.channels.saveRequested.connect(self.save_channel)
+        self.channels.deleteRequested.connect(self.delete_channel)
+        self.channels.mergeRequested.connect(self.merge_channel)
+        self.channels.list.itemChanged.connect(self._on_channel_renamed)
+        dock3 = QDockWidget("通道", self)
+        dock3.setWidget(self.channels)
+        dock3.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.addDockWidget(Qt.RightDockWidgetArea, dock3)
+        self.channels_dock = dock3
 
         self.zoom_label = QLabel("100%")
         self.status = self.statusBar()
@@ -259,11 +283,34 @@ class MainWindow(QMainWindow):
                                  "烧成普通位图图层，内容从此不可再改"))
         m_layer.addAction(self._act("栅格化图层", "", self.rasterize_selected,
                                     "文字图层 / 智能对象转成普通位图图层"))
-        m_layer.addAction(self._act("图层样式…", "", self.edit_layer_style,
-                                    "描边 / 投影 / 内阴影 / 外发光"))
+        m_sty = m_layer.addMenu("图层样式")
+        m_sty.addAction(self._act("图层样式…", "", self.edit_layer_style,
+                                  "10 种效果 + 全局光，参数化、随时可改"))
+        m_sty.addSeparator()
+        m_sty.addAction(self._act("复制图层样式", "Ctrl+Alt+C",
+                                  self.copy_layer_style,
+                                  "把选中图层的整套样式存进样式剪贴板"))
+        m_sty.addAction(self._act("粘贴图层样式", "Ctrl+Alt+V",
+                                  self.paste_layer_style,
+                                  "把剪贴板里的样式整份贴到选中图层"))
+        m_sty.addSeparator()
+        m_sty.addAction(self._act("存为默认值", "", self.save_style_default,
+                                  "之后新建的图层样式都从这份参数出发"))
+        m_sty.addAction(self._act("复位默认值", "", self.reset_style_default,
+                                  "回到出厂的默认样式参数"))
         m_layer.addSeparator()
         m_layer.addAction(self._act("置于顶层", "Ctrl+Shift+]", self.raise_to_top))
         m_layer.addAction(self._act("置于底层", "Ctrl+Shift+[", self.lower_to_bottom))
+
+        m_text = self.menuBar().addMenu("文字")
+        m_text.addAction(self._act("在画布上编辑文字", "Ctrl+T",
+                                   self.edit_text_on_canvas,
+                                   "直接在画布上打字，边改边看"))
+        m_text.addAction(self._act("逐字调整…", "", self.edit_text_chars,
+                                   "给单个字加字距 / 抬基线 / 拉宽"))
+        m_text.addSeparator()
+        m_text.addAction(self._act("栅格化文字", "", self.rasterize_text,
+                                   "转成普通位图图层，之后才能用画笔和滤镜"))
 
         m_filter = self.menuBar().addMenu("滤镜")
         for key in FILTER_ORDER:
@@ -277,6 +324,33 @@ class MainWindow(QMainWindow):
         m_view.addAction(self._act("实际像素", "Ctrl+1", self.view.zoom_actual))
         m_view.addAction(self._act("放大", "Ctrl++", lambda: self.view.set_zoom(self.view.zoom * 1.25)))
         m_view.addAction(self._act("缩小", "Ctrl+-", lambda: self.view.set_zoom(self.view.zoom / 1.25)))
+        m_view.addSeparator()
+        m_view.addAction(self._act("通道面板", "F2", self.toggle_channels_dock,
+                                   "显示 / 隐藏通道面板"))
+        m_view.addAction(self._act("图层面板", "", self.panel_dock.setVisible,
+                                   "显示 / 隐藏图层面板"))
+        m_view.addAction(self._act("属性面板", "", self.inspector_dock.setVisible,
+                                   "显示 / 隐藏属性面板"))
+
+        # 通道菜单（Photoshop 放在「选择」旁边，这里同理）
+        m_ch = self.menuBar().addMenu("通道")
+        m_ch.addAction(self._act("新建通道…", "Ctrl+Alt+N",
+                                 lambda: self.save_channel("__new__"),
+                                 "把当前选区存成一个 Alpha 通道"))
+        m_ch.addAction(self._act("载入选区", "", self._load_selected_channel,
+                                 "把选中的通道内容作为选区载入"))
+        m_ch.addAction(self._act("删除通道", "", self._delete_selected_channel,
+                                 "删除选中的附加 Alpha 通道"))
+        m_ch.addSeparator()
+        m_ch.addAction(self._act("并入合并的 Alpha（替换）", "", self._merge_replace,
+                                 "用选中通道替换合并的 Alpha 通道"))
+        m_ch.addAction(self._act("并入合并的 Alpha（添加）", "", self._merge_add))
+        m_ch.addAction(self._act("并入合并的 Alpha（减去）", "", self._merge_subtract))
+        m_ch.addSeparator()
+        m_ch.addAction(self._act("重置合并的 Alpha", "", self._reset_composite_alpha,
+                                 "恢复成所有图层合成后的原始不透明度"))
+        m_ch.addAction(self._act("RGB 全部显示", "", self._show_all_rgb,
+                                 "把红 / 绿 / 蓝三路都打开"))
 
         tb = self.addToolBar("主工具栏")
         for text, slot in (("新建", self.ask_new_document),
@@ -297,6 +371,11 @@ class MainWindow(QMainWindow):
         m_sel.addAction(self._act("羽化…", "", self.ask_feather))
         m_sel.addAction(self._act("扩展…", "", lambda: self.ask_grow("expand")))
         m_sel.addAction(self._act("收缩…", "", lambda: self.ask_grow("contract")))
+        m_sel.addAction(self._act("平滑…", "", self.ask_smooth))
+        m_sel.addAction(self._act("边界…", "", self.ask_border))
+        m_sel.addSeparator()
+        m_sel.addAction(self._act("色彩范围…", "", self.ask_color_range))
+        m_sel.addAction(self._act("快速蒙版", "Q", self.toggle_quick_mask))
         m_sel.addSeparator()
         m_sel.addAction(self._act("用前景色填充", "Alt+Delete",
                                   lambda: self.fill_with_fg(None, use_fg=True)))
@@ -383,7 +462,9 @@ class MainWindow(QMainWindow):
     def _update_title(self):
         name = self.doc.name if self.doc else ""
         path = self.doc.path if self.doc and self.doc.path else "未保存"
-        self.setWindowTitle("Compositor for Windows — %s  [%s]" % (name, path))
+        tag = "  [快速蒙版]" if quick_mask.is_on(self.doc) else ""
+        self.setWindowTitle("Compositor for Windows — %s  [%s]%s"
+                            % (name, path, tag))
 
     # ---------- 选择 ----------
 
@@ -395,6 +476,11 @@ class MainWindow(QMainWindow):
     def select_layer(self, lid):
         if lid != self.selected_id:
             self.stamp_float(silent=True)  # 换图层前先把浮动内容盖回去
+            # 正在画布上编辑文字时换了图层 -> 先把输入框收起来，
+            # 否则接着敲的字会被写进新选中的图层（见 §4.3 第 26 条）
+            editing = self.view.edit_text_layer()
+            if editing is not None and editing.id != lid:
+                self.view.end_text_edit()
         self.selected_id = lid
         self.on_select_changed(from_panel=False)
 
@@ -427,6 +513,11 @@ class MainWindow(QMainWindow):
 
         None 表示"整幅都要重算"。只有明确知道改动只影响一小块时才传矩形 ——
         传错了画面就会残留旧像素，宁可保守。
+
+        **脏区是一组矩形，不是一个**：一次拖拽可能在上百处落笔，逐次取并集
+        会很快涨成覆盖大半个画布的一个矩形，那些互不相邻的小块就被一起重算了。
+        所以这里保留成列表，只在「块数超上限」或「并集已占大半画布」时才
+        折叠成一个（见 `_dirty_rects`）。
         """
         if rect is None:
             self._full_dirty = True
@@ -437,12 +528,32 @@ class MainWindow(QMainWindow):
         x0, y0, x1, y1 = [int(v) for v in rect]
         if x1 <= x0 or y1 <= y0:
             return
+        cur = self._dirty
+        if cur is None:
+            self._dirty = (x0, y0, x1, y1)
+            return
+        if isinstance(cur, tuple):
+            cur = [cur]
+        # 和已有块相交或紧挨着就并进去（省掉一条缝，避免多渲一次）
+        merged = False
+        for i, r in enumerate(cur):
+            if x0 <= r[2] and r[0] <= x1 and y0 <= r[3] and r[1] <= y1:
+                cur[i] = (min(r[0], x0), min(r[1], y0),
+                          max(r[2], x1), max(r[3], y1))
+                merged = True
+                break
+        if not merged:
+            cur.append((x0, y0, x1, y1))
+        if len(cur) > DIRTY_MAX_RECTS:
+            cur = [_union(cur)]
+        self._dirty = cur[0] if len(cur) == 1 else cur
+
+    def _dirty_rects(self):
+        """当前的脏区，统一成"矩形列表"。空表示什么都不用重算。"""
         d = self._dirty
         if d is None:
-            self._dirty = (x0, y0, x1, y1)
-        else:
-            self._dirty = (min(d[0], x0), min(d[1], y0),
-                           max(d[2], x1), max(d[3], y1))
+            return []
+        return [d] if isinstance(d, tuple) else list(d)
 
     def request_render(self, rect=None, adjust=None):
         """请求一次渲染。rect 非空时只重算那一块（见 mark_dirty）。
@@ -506,7 +617,11 @@ class MainWindow(QMainWindow):
         return max(PROXY_MIN_SCALE, min(1.0, s))
 
     def _adj_snap_ok(self, layer):
-        """快路径的快照能不能用。"""
+        """快路径的快照能不能用。
+
+        顶层调整层看 `arr`；隔离组里的调整层要 `arr`（组外画布）与
+        `group`（组内缓冲）两份都在，缺一份就退回整幅。
+        """
         s = self._adj_snap
         if s is None or layer is None or self.doc is None:
             return False
@@ -515,7 +630,15 @@ class MainWindow(QMainWindow):
         arr = s.get("arr")
         if arr is None:
             return False
-        return arr.shape[0] == self.doc.height and arr.shape[1] == self.doc.width
+        if arr.shape[0] != self.doc.height or arr.shape[1] != self.doc.width:
+            return False
+        if self.doc.find(layer.id) is not None:
+            return True               # 顶层
+        grp = s.get("group")
+        if not isinstance(grp, dict) or grp.get("buf") is None:
+            return False
+        gb = grp["buf"]
+        return gb.shape[0] == self.doc.height and gb.shape[1] == self.doc.width
 
     def _use_tiles(self):
         """这次全量渲染要不要分块。
@@ -538,10 +661,27 @@ class MainWindow(QMainWindow):
             return True
         if has_dissolve(doc):
             return True                 # Dissolve 的噪声按缓冲尺寸生成，局部渲会错位
-        x0, y0, x1, y1 = self._dirty
-        area = float(max(0, x1 - x0) * max(0, y1 - y0))
-        whole = float(max(1, doc.width * doc.height))
-        return area > whole * PARTIAL_AREA_MAX
+        # 脏区可能是一组矩形（见 mark_dirty）：逐块判断，任一块超阈值就整幅
+        for x0, y0, x1, y1 in self._dirty_rects():
+            area = float(max(0, x1 - x0) * max(0, y1 - y0))
+            whole = float(max(1, doc.width * doc.height))
+            if area > whole * PARTIAL_AREA_MAX:
+                return True
+        return False
+
+    def _show(self, arr, scale=None):
+        """把渲染结果按通道可见性处理后送进画布。
+
+        **通道可见性只在这里生效** —— `_last_arr` 存的始终是**未经通道处理**
+        的合成结果。这样局部重渲染往 `_last_arr` 的脏区里补的那一块，
+        和周围的原始数据是同一套坐标 / 取值，不用额外考虑"当时哪些通道开着"，
+        也不会和 Photoshop 的行为对不上（PS 关红通道是显示为纸白，不是把 R 乘 0）。
+        """
+        arr = _ch.apply_channel_view(arr, self.doc) if self.doc is not None else arr
+        if scale is None:
+            self.view.set_pixmap(arr)
+        else:
+            self.view.set_pixmap(arr, scale=scale)
 
     def _do_render(self):
         self._render_pending = False
@@ -549,7 +689,6 @@ class MainWindow(QMainWindow):
         if doc is None:
             return
         t0 = time.perf_counter()
-
         # 0) 拖调整层滑块 + 有"它下方"的快照 -> 只重算调整层本身。
         #    大画布上这一步可能仍要几百毫秒（调整本身要碰每一个像素），
         #    那时拖动期间还是交给代理更跟手，停手后再用它出全分辨率。
@@ -565,7 +704,7 @@ class MainWindow(QMainWindow):
                 self._last_arr = arr
                 self._full_dirty = False
                 self._dirty = None
-                self.view.set_pixmap(arr)
+                self._show(arr)
                 self.view._update_handles()
                 self.inspector.on_rendered()
                 return
@@ -580,7 +719,7 @@ class MainWindow(QMainWindow):
                 arr, kx, ky = render_proxy(doc, s)
                 self._arr_valid = False      # 代理图不能当缓存，之后要补全分辨率
                 self._last_pass = "proxy"
-                self.view.set_pixmap(arr, scale=(kx, ky))
+                self._show(arr, scale=(kx, ky))
                 self.view._update_handles()
                 return
 
@@ -599,31 +738,41 @@ class MainWindow(QMainWindow):
             self._render_ms = (time.perf_counter() - t0) * 1000.0
             self._arr_valid = True
         else:
-            # 3) 只重算脏区，补回缓存的整幅结果里。
-            #    先按图层样式的外扩量把区域撑大（模糊要卷积上下文），算完裁回内核
+            # 3) 只重算脏区，补回缓存的整幅结果里。脏区可能是**一组**矩形
+            #    （一次拖拽在多处落笔），逐块渲、逐块写回。
+            #    先按图层样式的外扩量把每块撑大（模糊要卷积上下文），算完裁回内核
             pad = max_effect_padding(doc)
-            x0, y0, x1, y1 = self._dirty
-            ex0 = max(0, x0 - pad)
-            ey0 = max(0, y0 - pad)
-            ex1 = min(doc.width, x1 + pad)
-            ey1 = min(doc.height, y1 + pad)
             arr = self._last_arr
-            if ex1 > ex0 and ey1 > ey0:
+            for x0, y0, x1, y1 in self._dirty_rects():
+                ex0 = max(0, x0 - pad)
+                ey0 = max(0, y0 - pad)
+                ex1 = min(doc.width, x1 + pad)
+                ey1 = min(doc.height, y1 + pad)
+                if ex1 <= ex0 or ey1 <= ey0:
+                    continue
+                # **只回写脏区本身，不回写外扩的那一圈**。外扩区只是给模糊
+                # 提供卷积上下文用的，那里的像素是"在截断的上下文里算出来的"，
+                # 写进缓存会覆盖掉本來正确的值 —— 投影拖尾刚好越过脏区边界时
+                # 就能看到一条接缝。实测这条曾让局部重渲染与整幅差 131/255。
+                sub = None
                 if self._use_tiles():
-                    # 直接写进缓存数组的那一块，不另外开 (h,w,4) 的临时结果
-                    if render_region_tiled(doc, (ex0, ey0, ex1, ey1),
-                                           out=arr[ey0:ey1, ex0:ex1],
-                                           tile=TILE_EDGE) is None:
-                        arr[ey0:ey1, ex0:ex1] = render_document(
-                            doc, region=(ex0, ey0, ex1, ey1))
-                else:
-                    arr[ey0:ey1, ex0:ex1] = render_document(
+                    # 分块渲染的 out= 只能写进一块连续缓冲，不能直接指向
+                    # 缓存里的那一段（否则外扩区也被覆盖，见上面的注释），
+                    # 所以照样先落到临时缓冲再回写脏区。
+                    tmp = np.empty((ey1 - ey0, ex1 - ex0, 4), np.uint8)
+                    sub = render_region_tiled(doc, (ex0, ey0, ex1, ey1),
+                                               out=tmp, tile=TILE_EDGE)
+                if sub is None:
+                    sub = render_document(
                         doc, region=(ex0, ey0, ex1, ey1))
-            self._last_pass = "partial"
+                arr[y0:y1, x0:x1] = sub[y0 - ey0:y1 - ey0, x0 - ex0:x1 - ex0]
+            self._last_pass = "partial" if len(self._dirty_rects()) == 1 \
+                else "partial-multi"
         self._full_dirty = False
         self._dirty = None
         self._last_arr = arr
-        self.view.set_pixmap(arr)
+        self._show(arr)
+        self._show_channels_panel(arr)
         self.view._update_handles()
         self.inspector.on_rendered()
 
@@ -792,9 +941,17 @@ class MainWindow(QMainWindow):
             return
         self.set_document(doc, reset_history=True)
         self.view.fit()
-        self.status.showMessage(
-            "已导入 %s —— %d 个顶层图层（文字 / 智能对象 / 调整层已合并为位图）"
-            % (os.path.basename(path), len(doc.layers)), 6000)
+        bits = ["已导入 %s —— %d 个顶层图层"
+                % (os.path.basename(path), len(doc.layers))]
+        if STATS["text"]:
+            bits.append("%d 个文字层已还原成可编辑文字" % STATS["text"])
+        if STATS["text_fallback"]:
+            bits.append("%d 个文字层因字体缺失或混排转为位图"
+                        % STATS["text_fallback"])
+        if STATS["effects"]:
+            bits.append("%d 个图层带上图层样式" % STATS["effects"])
+        bits.append("智能对象 / 调整层仍为合并位图")
+        self.status.showMessage("；".join(bits), 8000)
 
     # ---------- 文字 ----------
 
@@ -827,6 +984,31 @@ class MainWindow(QMainWindow):
         self.status.showMessage(
             "文字已创建 —— 在右侧「属性」面板里改字 / 字体 / 字号，随时可改", 5000)
         return layer
+
+    def edit_text_on_canvas(self):
+        """Ctrl+T：在画布上直接改文字图层的字。"""
+        layer = self.selected_layer()
+        if layer is None or not layer.is_text or layer.text is None:
+            self.status.showMessage(
+                "先选中一个文字图层（用文字工具点画布可以新建）", 4000)
+            return False
+        if not self.view.begin_text_edit(layer):
+            return False
+        self.status.showMessage(
+            "直接在画布上打字，Esc 结束 —— 改的是文字参数，之后随时还能再改", 6000)
+        return True
+
+    def edit_text_chars(self):
+        """逐字调整对话框（字距 / 基线 / 横向缩放）。"""
+        layer = self.selected_layer()
+        if layer is None or not layer.is_text or layer.text is None:
+            self.status.showMessage("先选中一个文字图层", 4000)
+            return None
+        from .text_dialog import CharAdjustDialog
+        dlg = CharAdjustDialog(self, self)
+        dlg.exec()
+        self.request_render()
+        return dlg
 
     def set_text_param(self, key, value):
         """改文字图层的一个参数并重新栅格化（非破坏性：参数还在）。"""
@@ -1019,7 +1201,8 @@ class MainWindow(QMainWindow):
         self.commit("移动选区内容")
         self.request_render()
         self.status.showMessage(
-            "已把选区内容揭成浮动层 —— 拖动移动，回车落定，Esc 丢弃", 5000)
+            "已把选区内容揭成浮动层 —— 拖动移动，拖手柄缩放"
+            "（Alt 以中心、Shift 等比），回车落定，Esc 丢弃", 6000)
         return True
 
     def stamp_float(self, silent=False):
@@ -1051,7 +1234,7 @@ class MainWindow(QMainWindow):
         return True
 
     def edit_layer_style(self):
-        """打开图层样式对话框（描边 / 投影 / 内阴影 / 外发光）。"""
+        """打开图层样式对话框（10 种效果 + 全局光）。"""
         layer = self.selected_layer()
         if layer is None:
             self.status.showMessage("请先选中一个图层")
@@ -1064,6 +1247,70 @@ class MainWindow(QMainWindow):
         dlg.exec()
         self.inspector.refresh()
         self.panel.rebuild()
+
+    # ---------- 图层样式的复制 / 粘贴 / 默认值 ----------
+
+    def _style_target(self, need_copy=False):
+        """-> 图层；不能用时提示并返回 None。"""
+        layer = self.selected_layer()
+        if layer is None:
+            self.status.showMessage("请先选中一个图层")
+            return None
+        if layer.is_group or layer.is_adjustment:
+            self.status.showMessage("图层组和调整层不支持图层样式")
+            return None
+        if need_copy and not layer.effects:
+            self.status.showMessage("这个图层没有图层样式")
+            return None
+        return layer
+
+    def copy_layer_style(self):
+        """把选中图层的整套样式存进剪贴板（含关闭的效果，方便整份迁移）。"""
+        from ..core.effects import EFFECT_NAMES, copy_style, enabled_effects
+        layer = self._style_target(need_copy=True)
+        if layer is None:
+            return False
+        copy_style(layer.effects)
+        names = [EFFECT_NAMES[k]
+                 for k in enabled_effects(layer.effects)]
+        self.status.showMessage(
+            "已复制图层样式：%s" % ("、".join(names) if names else "（没有启用的效果）"),
+            4000)
+        return True
+
+    def paste_layer_style(self):
+        """整份覆盖当前图层的样式。"""
+        from ..core.effects import has_style_clipboard, paste_style
+        layer = self._style_target()
+        if layer is None:
+            return False
+        if not has_style_clipboard():
+            self.status.showMessage("剪贴板里没有图层样式")
+            return False
+        layer.effects = paste_style()
+        self.commit("粘贴图层样式")
+        self.request_render()
+        self.inspector.refresh()
+        self.panel.rebuild()
+        self.status.showMessage("已粘贴图层样式", 4000)
+        return True
+
+    def save_style_default(self):
+        """把选中图层的当前参数存成默认值（下次新建样式从它出发）。"""
+        from ..core.effects import save_style_default as _save
+        layer = self._style_target(need_copy=True)
+        if layer is None:
+            return False
+        _save(layer.effects)
+        self.status.showMessage("已把当前参数存为图层样式的默认值", 4000)
+        return True
+
+    def reset_style_default(self):
+        """清掉用户存的默认值，回到出厂参数。"""
+        from ..core.effects import reset_style_default as _reset
+        _reset()
+        self.status.showMessage("已复位图层样式的默认值", 4000)
+        return True
 
     def _reject_text_layer(self, what):
         """像素是"算出来"的图层不能直接改像素 —— 先挡住。
@@ -1328,6 +1575,9 @@ class MainWindow(QMainWindow):
     def select_all(self):
         if not self._require_doc():
             return
+        if quick_mask.is_on(self.doc):
+            self.fill_quick_mask(255)
+            return
         self.doc.detach_selection()
         self.doc.selection = Selection.all(self.doc.width, self.doc.height)
         self.commit("全选")
@@ -1336,13 +1586,167 @@ class MainWindow(QMainWindow):
     def deselect(self):
         if not self._require_doc():
             return
+        if quick_mask.is_on(self.doc):
+            self.fill_quick_mask(0)
+            return
         self.stamp_float(silent=True)
         self.doc.detach_selection()
         self.doc.selection = None
         self.commit("取消选择")
         self.view.update_selection_overlay()
 
+    # ---------- 通道（core.channels） ----------
+
+    def _show_channels_panel(self, arr):
+        """把刚渲出来的**原始**合成结果喂给通道面板生成缩略图。
+
+        传原始 arr（不是 `_show()` 处理过的）：PS 的通道缩略图始终显示
+        通道的**真实内容**，不受"这一路当前可不可见"影响。
+        """
+        if hasattr(self, "channels"):
+            self.channels.set_render(arr)
+
+    def load_channel_selection(self, cid):
+        """把通道内容作为选区载入画布。"""
+        doc = self.doc
+        if doc is None or not cid:
+            return
+        if str(cid) == _ch.COMPOSITE_ROW:
+            if doc.composite_alpha is None:
+                self.status.showMessage("还没有合并的 Alpha 通道", 2500)
+                return
+            doc.detach_selection()
+            from .selection import Selection
+            if not doc.composite_alpha.any():
+                doc.selection = None
+            else:
+                doc.selection = Selection(doc.width, doc.height,
+                                          doc.composite_alpha.copy())
+        elif str(cid).startswith(_ch.RGB_ROW_PREFIX):
+            # RGB / Alpha 那一路：按当前渲染结果的对应分量当灰度选区
+            arr = self._last_arr
+            if arr is None:
+                return
+            doc.detach_selection()
+            from .selection import Selection
+            g = _ch.channel_thumb(arr, str(cid)[1:], doc.width)
+            if not g.any():
+                doc.selection = None
+            else:
+                doc.selection = Selection(doc.width, doc.height, g)
+        else:
+            if _ch.channel_to_selection(doc, cid) is None and \
+                    _ch.find_channel(doc, cid) is None:
+                return
+        self.commit("载入选区")
+        self.view.update_selection_overlay()
+        self.channels.rebuild()
+
+    def save_channel(self, cid):
+        """新建 Alpha 通道并存入当前选区。"""
+        doc = self.doc
+        if doc is None:
+            return
+        if cid != "__new__":
+            return
+        ch = _ch.selection_to_channel(doc, "Alpha %d" % (
+            len(doc.channels) + 1))
+        if ch is None:
+            self.status.showMessage(
+                "通道已达上限（%d 个）" % _ch.MAX_CHANNELS, 3000)
+            return
+        self.commit("新建通道")
+        self.channels.rebuild()
+        self.channels.select_id(ch.id)
+        self.status.showMessage("已新建通道「%s」" % ch.name, 2500)
+
+    def delete_channel(self, cid):
+        doc = self.doc
+        if doc is None or not cid:
+            return
+        ch = _ch.remove_channel(doc, cid)
+        if ch is None:
+            return
+        self.commit("删除通道")
+        self.channels.rebuild()
+        self.status.showMessage("已删除通道「%s」" % ch.name, 2500)
+
+    def merge_channel(self, cid, mode="replace"):
+        """把通道并进「合并的 Alpha 通道」（只改显示，不动图层数据）。"""
+        doc = self.doc
+        if doc is None or not cid:
+            return
+        if doc.composite_alpha is None:
+            arr = self._last_arr
+            if arr is None:
+                return
+            doc.composite_alpha = _ch.composite_alpha_of(arr)
+        if _ch.merge_channel_into_alpha(doc, cid, mode):
+            self.commit("并入合并 Alpha")
+            self.channels.rebuild()
+            self.request_render()
+
+    def _on_channel_renamed(self, item):
+        """QListWidget 的行内编辑结束 -> 落到 Channel.name 上。"""
+        if item is None or not item.data(_CH_ROLE_MASK):
+            return
+        self.channels._on_rename(item, item.text())
+
+    def toggle_channels_dock(self):
+        v = not self.channels_dock.isVisible()
+        self.channels_dock.setVisible(v)
+
+    def _load_selected_channel(self):
+        cid = self.channels.current_id()
+        if cid:
+            self.load_channel_selection(cid)
+
+    def _delete_selected_channel(self):
+        cid = self.channels.current_id()
+        if cid and not cid.startswith(_ch.RGB_ROW_PREFIX) \
+                and cid != _ch.COMPOSITE_ROW:
+            self.delete_channel(cid)
+        elif cid:
+            self.status.showMessage("画布自带的通道不能删除", 2500)
+
+    def _merge_replace(self):
+        self._merge_selected("replace")
+
+    def _merge_add(self):
+        self._merge_selected("add")
+
+    def _merge_subtract(self):
+        self._merge_selected("subtract")
+
+    def _merge_selected(self, mode):
+        cid = self.channels.current_id()
+        if not cid or cid.startswith(_ch.RGB_ROW_PREFIX) \
+                or cid == _ch.COMPOSITE_ROW:
+            self.status.showMessage("请先选中一个附加的 Alpha 通道", 2500)
+            return
+        self.merge_channel(cid, mode)
+
+    def _reset_composite_alpha(self):
+        if self.doc is None or self.doc.composite_alpha is None:
+            return
+        _ch.reset_composite_alpha(self.doc)
+        self.commit("重置合并 Alpha")
+        self.channels.rebuild()
+        self.request_render()
+
+    def _show_all_rgb(self):
+        if self.doc is None:
+            return
+        v = _ch.rgb_visibility(self.doc)
+        for k in _ch.RGB_KEYS:
+            v[k] = True
+        self.channels.rebuild()
+        self.request_render()
+
     def invert_selection(self):
+        if quick_mask.is_on(self.doc):
+            self.invert_quick_mask()
+            return
         sel = self._sel()
         if sel is None or sel.is_empty:
             self.select_all()
@@ -1380,6 +1784,105 @@ class MainWindow(QMainWindow):
             self.doc.selection.contract(v)
         self.commit(title)
         self.view.update_selection_overlay()
+
+    def ask_smooth(self):
+        sel = self._sel()
+        if sel is None or sel.is_empty:
+            return
+        v, ok = QInputDialog.getInt(self, "平滑", "取样半径 (px):",
+                                    3, 1, 100, 1)
+        if not ok:
+            return
+        self.doc.detach_selection()
+        self.doc.selection.smooth(v)
+        self.commit("平滑选区")
+        self.view.update_selection_overlay()
+
+    def ask_border(self):
+        sel = self._sel()
+        if sel is None or sel.is_empty:
+            return
+        v, ok = QInputDialog.getInt(self, "边界", "边界宽度 (px):",
+                                    8, 1, 500, 1)
+        if not ok:
+            return
+        self.doc.detach_selection()
+        self.doc.selection.border(v)
+        self.commit("边界选区")
+        self.view.update_selection_overlay()
+
+    def ask_color_range(self):
+        """色彩范围对话框。"""
+        if not self._require_doc():
+            return
+        from .color_range_dialog import ColorRangeDialog
+        rgb = self.composite_rgb()
+        dlg = ColorRangeDialog(self, rgb, self.doc.selection)
+        dlg.selectionReady.connect(self._apply_color_range)
+        dlg.exec()
+
+    def _apply_color_range(self, mask, mode):
+        """把色彩范围算出的遮罩按 mode 合并进当前选区。"""
+        sel = Selection(self.doc.width, self.doc.height, mask)
+        if sel.is_empty:
+            self.status.showMessage("没有命中任何像素 —— 调大容差试试", 4000)
+            return
+        self.commit_selection(sel, mode)
+
+    # ---------- 快速蒙版 ----------
+
+    def toggle_quick_mask(self):
+        """Q：在「选区」和「可以直接涂的遮罩」之间来回切。"""
+        if not self._require_doc():
+            return
+        if quick_mask.is_on(self.doc):
+            self.stamp_float(silent=True)
+            if not quick_mask.exit_to_selection(self.doc):
+                return
+            self.commit("退出快速蒙版")
+            self.status.showMessage("已退出快速蒙版 —— 遮罩变成了选区", 4000)
+        else:
+            self.stamp_float(silent=True)
+            if not quick_mask.enter(self.doc):
+                return
+            self.commit("进入快速蒙版")
+            self.status.showMessage(
+                "快速蒙版：涂黑 = 排除出选区，涂白 = 纳入选区，再按 Q 退出", 6000)
+        self.view.update_selection_overlay()
+        self._sync_quick_mask_ui()
+
+    def set_quick_mask_mode(self, mode):
+        """红色盖在哪一边：masked = 盖未选中区（默认）。"""
+        if self.doc is None or not quick_mask.is_on(self.doc):
+            return
+        self.doc.quick_mask_mode = mode
+        self.view.update_selection_overlay()
+
+    def fill_quick_mask(self, value):
+        """整片遮罩填成某个灰度（0~255）。"""
+        if self.doc is None or not quick_mask.is_on(self.doc):
+            return False
+        self.doc.detach_quick_mask()
+        self.doc.quick_mask = np.full(
+            (self.doc.height, self.doc.width), int(np.clip(value, 0, 255)),
+            np.uint8)
+        self.commit("填充快速蒙版")
+        self.view.update_selection_overlay()
+        return True
+
+    def invert_quick_mask(self):
+        if self.doc is None or not quick_mask.is_on(self.doc):
+            return False
+        self.doc.detach_quick_mask()
+        self.doc.quick_mask = (255 - self.doc.quick_mask).astype(np.uint8)
+        self.commit("反相快速蒙版")
+        self.view.update_selection_overlay()
+        return True
+
+    def _sync_quick_mask_ui(self):
+        """进/出快速蒙版时把模式写进标题栏（常驻提示，不会被临时消息冲掉）。"""
+        self._update_title()
+        self.inspector.refresh()
 
     def mask_from_selection(self):
         """把当前选区转成当前图层的蒙版。"""
@@ -1442,6 +1945,11 @@ class MainWindow(QMainWindow):
 
     def fill_with_fg(self, pt=None, use_fg=True):
         """油漆桶 / 填充。pt 为 None 时按当前选区填充整层。"""
+        if quick_mask.is_on(self.doc):
+            # 快速蒙版模式下"填充"填的是那张遮罩：前景色黑的涂满 = 整片取消
+            color = self.opts.fg.rgb() if use_fg else self.opts.bg.rgb()
+            self.fill_quick_mask(_gray(color))
+            return
         layer = self.selected_layer()
         if layer is None or layer.is_group:
             self.status.showMessage("请先选中一个图层")
@@ -1471,6 +1979,10 @@ class MainWindow(QMainWindow):
 
     def delete_in_selection(self):
         """清除选区内的像素（Delete）。"""
+        if quick_mask.is_on(self.doc):
+            # 快速蒙版模式下 Delete = 把遮罩清成 0（整片取消选中）
+            self.fill_quick_mask(0)
+            return
         sel = self._sel()
         layer = self.selected_layer()
         if sel is None or sel.is_empty:

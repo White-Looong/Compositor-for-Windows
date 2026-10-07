@@ -180,6 +180,52 @@ class Selection:
         dist = cv2.distanceTransform(self.mask, cv2.DIST_L2, 3)
         self.mask[dist <= px] = 0
 
+    def smooth(self, radius):
+        """平滑：抹掉选区边缘的锯齿（PS 的「平滑」）。
+
+        做法是**邻域多数表决** —— 半径 r 的方形窗口里，选中像素过半就整块
+        判为选中，否则整块判为未选中。半径越大，细小的凸起 / 凹陷越会被抹掉
+        （凸起被吃掉、凹陷被填平），但大块的形状不会变。
+
+        已经羽化过的像素（0 < v < 255）保留原值 —— 平滑只决定"算不算选中"，
+        不该把用户羽化出来的过渡带又抹成硬边。
+        """
+        r = int(max(1, round(float(radius))))
+        k = 2 * r + 1
+        m = self.mask.astype(np.float32) / 255.0
+        # 边框按常数 0 补：画布外当作"没选中"，否则贴边的选区会被撑大
+        avg = cv2.blur(m, (k, k), borderType=cv2.BORDER_CONSTANT)
+        out = np.where(avg >= 0.5, 255, 0).astype(np.uint8)
+        soft = (self.mask > 0) & (self.mask < 255)
+        if soft.any():
+            out[soft] = self.mask[soft]
+        self.mask = out
+
+    def border(self, width):
+        """边界：沿原选区的轮廓生成一条环带（PS 的「边界」）。
+
+        width 是环带总宽（像素），向轮廓内外各取一半（最小 1 px）。
+        用距离变换而不是形态学，是为了让奇数宽度也能给出对称的环带，
+        而且羽化过的内部像素值能保留下来。
+        """
+        w = float(max(1.0, width))
+        each = max(1.0, round(w / 2.0))
+        bin_ = (self.mask >= 128).astype(np.uint8)
+        din = cv2.distanceTransform(bin_, cv2.DIST_L2, 3)
+        dout = cv2.distanceTransform((1 - bin_).astype(np.uint8),
+                                     cv2.DIST_L2, 3)
+        band = (((din > 0.0) & (din <= each + 0.5)) |
+                ((dout > 0.0) & (dout <= each + 0.5)))
+        if not band.any():
+            self.mask = np.zeros_like(self.mask)
+            return
+        out = np.zeros_like(self.mask)
+        out[band] = 255
+        inner = band & (din > 0.0)
+        if inner.any():
+            out[inner] = self.mask[inner]
+        self.mask = out
+
     def invert(self):
         self.mask = (255 - self.mask).astype(np.uint8)
 

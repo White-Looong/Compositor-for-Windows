@@ -45,6 +45,27 @@ def _layer_pad(layer):
     return effect_padding(layer.effects)
 
 
+def _effect_frame(layer, doc, org_x, org_y, lx0, ly0):
+    """图层样式里"与内容对齐"的效果（渐变 / 图案叠加）要用的坐标系。
+
+    返回 (ox, oy, fw, fh)：patch 左上角在"内容框"里的位置 + 框的尺寸，
+    内容框 = 图层自己的包围盒（画布坐标）。
+
+    不这么做的话这两种效果只能按 patch 自身的行列号画 —— 而 patch 的
+    左上角取决于**这次渲染的区域**（整幅 / 脏区 / 瓦片各不相同），
+    同一条渐变会被渲到不同位置，局部渲染就和整幅对不上了。
+    """
+    box = layer.bbox(doc.width, doc.height)
+    if box is None:
+        return None
+    x0 = int(math.floor(box[0]))
+    y0 = int(math.floor(box[1]))
+    x1 = int(math.ceil(box[2]))
+    y1 = int(math.ceil(box[3]))
+    return (org_x + lx0 - x0, org_y + ly0 - y0,
+            max(x1 - x0, 1), max(y1 - y0, 1))
+
+
 def _interp_flags(sx, sy):
     s = (abs(sx) + abs(sy)) / 2.0
     return cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
@@ -114,8 +135,64 @@ def _crop_matrix(M, x0, y0):
     return M2
 
 
+def _integer_shift(M):
+    """M 是不是"无旋转 / 无翻转 / 1:1 缩放"的整数平移？是则返回 (dx, dy)。
+
+    这种情形（未变换或只挪了整像素的图层）在真实工程里占绝大多数 ——
+    抠图、拼图、逐像素对齐都是。命中时 `cv2.warpAffine` 纯属浪费：它会
+    把**整张源图**转成 float32 再插值回来，而答案就是"原样搬过去"。
+    12 MP 下 `_warp_straight` 里 2.6 s 有 2.4 s 花在这些转换上，
+    走这条快路径能省掉其中绝大部分（见 §5.32）。
+    """
+    a, c, b, d = M[0, 0], M[0, 1], M[1, 0], M[1, 1]
+    if abs(a - 1.0) > 1e-9 or abs(d - 1.0) > 1e-9:
+        return None
+    if abs(b) > 1e-9 or abs(c) > 1e-9:
+        return None
+    dx, dy = M[0, 2], M[1, 2]
+    ix, iy = int(round(dx)), int(round(dy))
+    if abs(dx - ix) > 1e-9 or abs(dy - iy) > 1e-9:
+        return None
+    return ix, iy
+
+
+def _place_shift(src, ix, iy, dsize):
+    """把 src 按整数平移放进 dsize 的缓冲，返回 (color float32, alpha float32)。
+
+    1:1 放置时**不需要预乘 / 反预乘**：`_warp_straight` 那套
+    `pm = rgb*a` 再 `pm/max(a,1e-6)` 的往返，数学上就等于原色本身
+    （直线 alpha 的定义）。省掉这一轮往返既更快，也少两次舍入。
+
+    **uint8 → float 只能用除法，不能用 `* (1/255)`**：后者与 `/255.0` 的
+    浮点结果差 1 ulp，量化到 uint8 就是 134 vs 135，uitest 直接抓到。
+    """
+    dw, dh = dsize
+    sh, sw = src.shape[:2]
+    sx0, sy0 = max(0, -ix), max(0, -iy)
+    dx0, dy0 = max(0, ix), max(0, iy)
+    w = min(sw - sx0, dw - dx0)
+    h = min(sh - sy0, dh - dy0)
+    if w <= 0 or h <= 0:
+        return None
+    sub = src[sy0:sy0 + h, sx0:sx0 + w]
+    a = np.zeros((dh, dw, 1), np.float32)
+    c = np.zeros((dh, dw, 3), np.float32)
+    dst_a = a[dy0:dy0 + h, dx0:dx0 + w]
+    dst_c = c[dy0:dy0 + h, dx0:dx0 + w]
+    np.divide(sub[:, :, 3:4], 255.0, out=dst_a)
+    np.divide(sub[:, :, :3], 255.0, out=dst_c)
+    return c, a
+
+
 def _warp_straight(src, M, dsize, flags):
     """变换 RGBA 位图，返回 (color float32 0..1, alpha float32 0..1)。"""
+    # 整数平移走快路径：不做插值、只转换落在缓冲里的那一块源像素
+    sh = _integer_shift(M)
+    if sh is not None:
+        out = _place_shift(src, sh[0], sh[1], dsize)
+        if out is not None:
+            return out
+
     a_src = src[..., 3:4].astype(np.float32) / 255.0
     rgb = (src[..., :3].astype(np.float32) / 255.0) * a_src   # 预乘
     a = cv2.warpAffine(a_src, M, dsize, flags=flags,
@@ -253,7 +330,10 @@ def _composite_base(layer, doc, acc_c, acc_a, org_x, org_y, chain,
         return
     c, a, lx0, ly0, lx1, ly1 = got
     if layer.effects:
-        c, a = apply_effects(c, a, layer.effects)   # 效果尺寸按画布像素，变换后再加
+        # 效果尺寸按画布像素，变换后再加；frame 给渐变 / 图案叠加定位
+        c, a = apply_effects(c, a, layer.effects,
+                             _effect_frame(layer, doc, org_x, org_y,
+                                           lx0, ly0))
     h = ly1 - ly0
     w = lx1 - lx0
     tc = np.zeros((h, w, 3), np.float32)
@@ -266,25 +346,59 @@ def _composite_base(layer, doc, acc_c, acc_a, org_x, org_y, chain,
               "Normal" if layer.blend == PASS_THROUGH else layer.blend)
 
 
+def _holds_direct(group, target):
+    """`target` 是不是 `group` 的**直接子**（只支持一层的组，见 render_from_snapshot）。"""
+    if target is None or not group.is_group:
+        return False
+    for c in group.children:
+        if c is target:
+            return True
+    return False
+
+
+def _new_gsnap(group, isolated):
+    """组内快照槽。`isolated` 决定 `_store_snap` 写 `buf` 还是 `arr`。"""
+    return {"gid": group.id, "blend": group.blend,
+            "opacity": float(group.opacity), "isolated": bool(isolated),
+            "buf": None}
+
+
 def _composite_one(layer, doc, acc_c, acc_a, org_x, org_y,
-                   snap_layer=None, snap=None):
-    """把单个位图 / 组图层按自身的混合模式与不透明度合成进 acc。"""
+                   snap_layer=None, snap=None, gsnap=None):
+    """把单个位图 / 组图层按自身的混合模式与不透明度合成进 acc。
+
+    gsnap 非 None 时表示"组内缓冲正等着被快照"（见 `_composite_list`）。
+    """
     bw = acc_c.shape[1]
     bh = acc_c.shape[0]
 
     if layer.is_group:
-        if layer.blend == PASS_THROUGH and layer.opacity >= 1.0:
-            # 不隔离：子图层直接与下方背景混合
+        passthrough = (layer.blend == PASS_THROUGH and layer.opacity >= 1.0)
+        if passthrough:
+            # 不隔离：子图层直接与下方背景混合。组内没有独立缓冲，
+            # 调整层下方的状态就是画布 acc，快路径按顶层那一套处理即可。
+            inner = gsnap
+            if snap is not None and _holds_direct(layer, snap_layer):
+                gsnap.clear()
+                gsnap.update(_new_gsnap(layer, False))
+                inner = gsnap
             _composite_list(layer.children, doc, acc_c, acc_a, org_x, org_y,
-                            snap_layer, snap)
+                            snap_layer, snap, inner)
             return
         gc = np.zeros((bh, bw, 3), np.float32)
         ga = np.zeros((bh, bw, 1), np.float32)
+        # 目标调整层是本组的**直接子**时，额外存一份"组外画布 acc"。
+        # 组内那份由 `_store_snap` 存进 gsnap —— 两份拼起来才能重放。
+        inner = gsnap
+        if snap is not None and _holds_direct(layer, snap_layer):
+            _store_snap(snap, acc_c, acc_a)
+            gsnap.clear()
+            gsnap.update(_new_gsnap(layer, True))
+            inner = gsnap
         _composite_list(layer.children, doc, gc, ga, org_x, org_y,
-                        snap_layer, snap)
+                        snap_layer, snap, inner)
         ga *= float(layer.opacity)
-        mode = "Normal" if layer.blend == PASS_THROUGH else layer.blend
-        composite(acc_c, acc_a, gc, ga, mode)
+        composite(acc_c, acc_a, gc, ga, layer.blend)
         return
 
     got = _warp_layer(layer, doc, org_x, org_y, bw, bh, _layer_pad(layer))
@@ -292,20 +406,23 @@ def _composite_one(layer, doc, acc_c, acc_a, org_x, org_y,
         return
     c, a, lx0, ly0, lx1, ly1 = got
     if layer.effects:
-        c, a = apply_effects(c, a, layer.effects)
+        c, a = apply_effects(c, a, layer.effects,
+                             _effect_frame(layer, doc, org_x, org_y,
+                                           lx0, ly0))
     a = a * float(layer.opacity)
     composite(acc_c[ly0:ly1, lx0:lx1], acc_a[ly0:ly1, lx0:lx1], c, a,
               layer.blend)
 
 
 def _composite_list(layers, doc, acc_c, acc_a, org_x, org_y,
-                    snap_layer=None, snap=None):
+                    snap_layer=None, snap=None, gsnap=None):
     """把 layers（底->顶）合成进累加缓冲。
 
     acc_c/acc_a 覆盖画布区域 [org_x, org_x+bw) x [org_y, org_y+bh)。
 
     snap_layer / snap：给"拖调整层滑块"的快路径服务 —— 走到 snap_layer
     之前时，把当前的 acc 存进 snap（见 render_from_snapshot）。
+    gsnap：非 None 时是"组内缓冲的快照槽"，`_store_snap` 会往里写。
     """
     n = len(layers)
     i = 0
@@ -317,7 +434,9 @@ def _composite_list(layers, doc, acc_c, acc_a, org_x, org_y,
 
         if layer.is_adjustment:
             if snap is not None and layer is snap_layer:
-                _store_snap(snap, acc_c, acc_a)
+                # 在组内就存进 gsnap（组外画布那份在进入组时就存好了）
+                _store_snap(gsnap if gsnap is not None else snap,
+                            acc_c, acc_a)
             _apply_adjust(acc_c, acc_a, layer, doc, org_x, org_y)
             i += 1
             continue
@@ -335,7 +454,7 @@ def _composite_list(layers, doc, acc_c, acc_a, org_x, org_y,
                             snap_layer, snap)
         else:
             _composite_one(layer, doc, acc_c, acc_a, org_x, org_y,
-                           snap_layer, snap)
+                           snap_layer, snap, gsnap)
         i = j
 
 
@@ -360,7 +479,12 @@ def _store_snap(snap, acc_c, acc_a):
 
     分块渲染（`render_tiled`）走 `dst` / `box` 两支：瓦片只有 tile² 那么大，
     快照得按瓦片核心区**分批写进**整幅数组，不能每块都新建一份。
+
+    键：`arr` 是**顶层**（画布）槽，`buf` 是**组内**槽 ——
+    见 `_composite_one` 里对隔离组的处理。用不同键是为了让
+    `render_from_snapshot` 一眼看出快照齐不齐（少一层就该退回整幅）。
     """
+    key = "buf" if snap.get("isolated", "gid" in snap) else "arr"
     dst = snap.get("dst")
     if dst is not None:
         cy, cx, ch, cw = snap["box"]
@@ -368,12 +492,12 @@ def _store_snap(snap, acc_c, acc_a):
                     acc_a[cy:cy + ch, cx:cx + cw])
         return
     if SNAP_DTYPE == np.float32:
-        snap["arr"] = np.ascontiguousarray(
+        snap[key] = np.ascontiguousarray(
             np.concatenate([acc_c, acc_a], axis=2))
         return
     rgb = np.clip(acc_c * 255.0 + 0.5, 0, 255).astype(np.uint8)
     a = np.clip(acc_a * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    snap["arr"] = np.ascontiguousarray(np.concatenate([rgb, a], axis=2))
+    snap[key] = np.ascontiguousarray(np.concatenate([rgb, a], axis=2))
 
 
 def render_document(doc, region=None, snap_layer=None, snap=None):
@@ -402,8 +526,14 @@ def render_document(doc, region=None, snap_layer=None, snap=None):
 
     acc_c = np.zeros((h, w, 3), np.float32)
     acc_a = np.zeros((h, w, 1), np.float32)
+    gsnap = {} if (snap is not None and cap_layer is not None
+                   and _inside_group(doc, cap_layer)) else None
     _composite_list(doc.layers, doc, acc_c, acc_a, x0, y0,
-                    cap_layer, snap if cap_layer is not None else None)
+                    cap_layer, snap if cap_layer is not None else None, gsnap)
+    if gsnap is not None and gsnap.get("gid"):
+        # 组内调整层：把组信息并进主快照，重放时两份（隔离组）或一份
+        # （Pass Through 组，`buf` 为 None）一起用
+        snap["group"] = dict(gsnap)
 
     # 浮动选区画在最上面（它不在 doc.layers 里）
     fl = getattr(doc, "float_layer", None)
@@ -416,44 +546,112 @@ def render_document(doc, region=None, snap_layer=None, snap=None):
     return np.ascontiguousarray(out)
 
 
+def _inside_group(doc, layer):
+    """`layer` 是不是嵌在某个组里（任意深度）。"""
+    for l in doc.layers:
+        if l.is_group:
+            stack = list(l.children)
+            while stack:
+                c = stack.pop()
+                if c is layer:
+                    return True
+                if c.is_group:
+                    stack.extend(c.children)
+    return False
+
+
+def _find_parent_group(doc, layer):
+    """返回 `layer` 的父组（找不到返回 None）。"""
+    for l in doc.layers:
+        if l.is_group:
+            stack = [l]
+            while stack:
+                g = stack.pop()
+                for c in g.children:
+                    if c is layer:
+                        return g
+                    if c.is_group:
+                        stack.append(c)
+    return None
+
+
 def render_from_snapshot(doc, layer, snap):
     """从"调整层下方的合成结果"出发，只重算它和它上面的图层。
 
     拖调整层滑块时，它**下方**所有图层的合成结果是不变的 —— 全幅重算里
     最贵的那部分（warp + 混合）可以整个跳掉，只留一次调整运算。
 
-    snap 里没有可用的快照、或这个调整层不在顶层 / 是剪贴蒙版时返回 None，
+    支持三种位置：
+      * **顶层**：`snap["arr"]` 就是它下方的画布合成结果
+      * **某个隔离组的直接子**：`snap["arr"]` 是组外的画布结果，
+        `snap["group"]["buf"]` 是组内它下方的结果。两份拼起来重放：
+        先在组内接着算完（调整层 + 组内其上的图层），再整组按自己的
+        混合模式 / 不透明度合成到画布上
+      * **某个 Pass Through 组的直接子**：组内没有独立缓冲，
+        `snap["arr"]` 直接就是它下方的状态，从组内接着算即可
+
+    组内**只支持一层**（更深就退回整幅）。拿不准的情况一律返回 None，
     调用方退回 `render_document()`。
     """
     if snap is None or layer is None:
         return None
     if not layer.is_adjustment or layer.clipped:
         return None                 # 剪贴蒙版作用于基底的独立缓冲，没有"下方 acc"
-    arr = snap.get("arr")
-    if arr is None:
-        return None
+    grp = snap.get("group")
     if snap.get("w") != doc.width or snap.get("h") != doc.height:
         return None
-    if arr.shape[0] != doc.height or arr.shape[1] != doc.width:
-        return None
+    if has_dissolve(doc):
+        return None                 # Dissolve 噪声按缓冲尺寸生成
+
+    sync_smart(doc)
     idx = None
     for i, l in enumerate(doc.layers):
         if l is layer:
             idx = i
             break
-    if idx is None:
-        return None                 # 嵌在组里的调整层：组的隔离缓冲没法复用
-    if has_dissolve(doc):
-        return None                 # Dissolve 噪声按缓冲尺寸生成
 
-    sync_smart(doc)
-    if arr.dtype == np.float32:
-        acc_c = np.ascontiguousarray(arr[..., :3])
-        acc_a = np.ascontiguousarray(arr[..., 3:4])
+    if idx is not None:
+        # ---- 顶层调整层 ----
+        arr = snap.get("arr")
+        if arr is None or arr.shape[:2] != (doc.height, doc.width):
+            return None
+        acc_c, acc_a = _restore_acc(arr)
+        _composite_list(doc.layers[idx:], doc, acc_c, acc_a, 0, 0)
+    elif grp is not None:
+        # ---- 组里的直接子调整层（隔离组 / Pass Through 都支持）----
+        g = doc.find(grp.get("gid"))
+        if g is None or not g.is_group:
+            return None
+        if not _holds_direct(g, layer):
+            return None             # 不是直接子 / 快照对不上 -> 退回整幅
+        gidx = next((i for i, l in enumerate(doc.layers) if l is g), None)
+        if gidx is None:
+            return None
+        j = next(i for i, c in enumerate(g.children) if c is layer)
+        if grp.get("isolated"):
+            # 隔离组：组内是独立缓冲。`arr` 是组外的画布，`buf` 是组内的
+            arr = snap.get("arr")
+            gbuf = grp.get("buf")
+            if (arr is None or gbuf is None
+                    or arr.shape[:2] != (doc.height, doc.width)
+                    or gbuf.shape[:2] != (doc.height, doc.width)):
+                return None
+            acc_c, acc_a = _restore_acc(arr)
+            gc, ga = _restore_acc(gbuf)
+            _composite_list(g.children[j:], doc, gc, ga, 0, 0)
+            composite(acc_c, acc_a, gc, ga * float(g.opacity), g.blend)
+        else:
+            # Pass Through：组内没有独立缓冲，"调整层下方"直接落在
+            # gsnap 的 `arr` 里（就是画布 acc），从那儿接着算即可
+            arr = grp.get("arr")
+            if arr is None or arr.shape[:2] != (doc.height, doc.width):
+                return None
+            acc_c, acc_a = _restore_acc(arr)
+            _composite_list(g.children[j:], doc, acc_c, acc_a, 0, 0)
+        # 组之上还有顶层图层的话接着算
+        _composite_list(doc.layers[gidx + 1:], doc, acc_c, acc_a, 0, 0)
     else:
-        acc_c = arr[..., :3].astype(np.float32) / 255.0
-        acc_a = arr[..., 3:4].astype(np.float32) / 255.0
-    _composite_list(doc.layers[idx:], doc, acc_c, acc_a, 0, 0)
+        return None                 # 嵌在组里但没有组内快照
 
     fl = getattr(doc, "float_layer", None)
     if fl is not None and fl.visible and fl.opacity > 0.0:
@@ -462,6 +660,15 @@ def render_from_snapshot(doc, layer, snap):
     rgb = np.clip(acc_c * 255.0, 0, 255).astype(np.uint8)
     alpha = np.clip(acc_a * 255.0, 0, 255).astype(np.uint8)
     return np.ascontiguousarray(np.concatenate([rgb, alpha], axis=2))
+
+
+def _restore_acc(arr):
+    """快照的 (h,w,4) -> (acc_c, acc_a) 两个 float32 缓冲。"""
+    if arr.dtype == np.float32:
+        return (np.ascontiguousarray(arr[..., :3]),
+                np.ascontiguousarray(arr[..., 3:4]))
+    return (arr[..., :3].astype(np.float32) / 255.0,
+            arr[..., 3:4].astype(np.float32) / 255.0)
 
 
 def max_effect_padding(doc):

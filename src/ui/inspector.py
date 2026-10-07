@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QHBoxLayout, QLabel, QPlainTextEdit,
                                QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
-from ..core.text import ALIGN_CENTER, ALIGN_ITEMS
+from ..core.text import ALIGN_CENTER, ALIGN_ITEMS, PARA_ITEMS
 from .adjust_panel import AdjustPanel
 from .tool_options import ColorSwatch
 
@@ -137,6 +137,20 @@ class Inspector(QWidget):
         self.txt_align.currentIndexChanged.connect(self._on_text_align)
         ft.addRow("对齐", self.txt_align)
 
+        # ---- 段落（第十五批）：缩进与段间距，单位是像素 ----
+        self.para_spins = {}
+        for key, label in PARA_ITEMS:
+            sp = QSpinBox()
+            sp.setRange(-2000, 2000)
+            sp.setSingleStep(2)
+            sp.setMaximumWidth(118)
+            sp.setToolTip("像素。段前 / 段后距只作用于段落之间"
+                          "（首段之前、末段之后不留）")
+            sp.valueChanged.connect(
+                lambda v, k=key: self._set_para(k, float(v)))
+            self.para_spins[key] = sp
+            ft.addRow(label, sp)
+
         style_row = QHBoxLayout()
         self.cb_bold = QCheckBox("粗体")
         self.cb_italic = QCheckBox("斜体")
@@ -147,6 +161,17 @@ class Inspector(QWidget):
             cb.toggled.connect(lambda v, k=key: self._set_text(k, bool(v)))
             style_row.addWidget(cb)
         ft.addRow(style_row)
+
+        edit_row = QHBoxLayout()
+        self.btn_canvas_edit = QPushButton("在画布上编辑")
+        self.btn_canvas_edit.setToolTip("Ctrl+T —— 直接在画布上改字，边改边看")
+        self.btn_canvas_edit.clicked.connect(self.main.edit_text_on_canvas)
+        self.btn_perchar = QPushButton("逐字调整…")
+        self.btn_perchar.setToolTip("给单个字加字距 / 抬基线 / 拉宽")
+        self.btn_perchar.clicked.connect(self.main.edit_text_chars)
+        edit_row.addWidget(self.btn_canvas_edit)
+        edit_row.addWidget(self.btn_perchar)
+        ft.addRow(edit_row)
 
         self.btn_raster = QPushButton("栅格化")
         self.btn_raster.setToolTip(
@@ -329,11 +354,31 @@ class Inspector(QWidget):
         self.cb_bold.setChecked(bool(p.get("bold", False)))
         self.cb_italic.setChecked(bool(p.get("italic", False)))
         self.cb_under.setChecked(bool(p.get("underline", False)))
+        para = p.get("para") or {}
+        for key, sp in self.para_spins.items():
+            try:
+                v = int(round(float(para.get(key, 0.0) or 0.0)))
+            except (TypeError, ValueError):
+                v = 0
+            sp.setValue(max(sp.minimum(), min(sp.maximum(), v)))
 
     def _set_text(self, key, value):
         if self._syncing:
             return
         self.main.set_text_param(key, value)
+
+    def _set_para(self, key, value):
+        """段落属性：一次写整份 dict（渲染那边按段落取值）。"""
+        if self._syncing:
+            return
+        layer = self.main.selected_layer()
+        if layer is None or not layer.is_text or layer.text is None:
+            return
+        para = dict(layer.text.get("para") or {})
+        if float(para.get(key, 0.0) or 0.0) == float(value):
+            return
+        para[key] = float(value)
+        self.main.set_text_param("para", para)
 
     def _on_text_content(self):
         if self._syncing:

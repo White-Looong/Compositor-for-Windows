@@ -6,11 +6,13 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QColorDialog,
-                               QComboBox, QDoubleSpinBox, QFontComboBox,
-                               QHBoxLayout, QLabel, QPushButton, QSlider,
-                               QSpinBox, QToolBar, QWidget)
+                               QComboBox, QDialog, QDoubleSpinBox,
+                               QFontComboBox, QHBoxLayout, QLabel,
+                               QPushButton, QSlider, QSpinBox, QToolBar,
+                               QWidget)
 
 from ..core.selection import ADD, INTERSECT, REPLACE, SUBTRACT
+from ..core.brush import BRUSH_DEFAULTS
 
 SEL_MODES = [
     ("新选区", REPLACE),
@@ -76,6 +78,8 @@ class ToolOptions(QToolBar):
         self.flow = 1.0
         self.smoothing = 0.25
         self.target = "pixel"
+        # 进阶笔刷参数（形状/间隔/散布/纹理/喷枪/压感），在「笔刷设置」对话框里改
+        self.brush = dict(BRUSH_DEFAULTS)
 
         # 新建文字图层时的默认字体设置
         self.font_family = ""
@@ -91,6 +95,7 @@ class ToolOptions(QToolBar):
         self._build_colors()
 
         self.current_tool = "move"
+        self.refresh_brush_summary()
         self.set_tool("move")
 
     # ---------- 构建 ----------
@@ -193,6 +198,16 @@ class ToolOptions(QToolBar):
         add_slider("流量", "flow", self.flow, "每次落笔的量")
         add_slider("平滑", "smoothing", self.smoothing, "笔画抖动抑制")
 
+        # 进阶参数（形状 / 间隔 / 散布 / 纹理 / 喷枪 / 压感）收进对话框
+        self.btn_brush = QPushButton("笔刷…")
+        self.btn_brush.setFixedHeight(26)
+        self.btn_brush.setToolTip("笔尖形状、间隔、散布、纹理、喷枪、压感")
+        self.btn_brush.clicked.connect(self.open_brush_dialog)
+        lay.addWidget(self.btn_brush)
+        self.lab_brush = QLabel()
+        self.lab_brush.setStyleSheet("color:#9a9a9e;")
+        lay.addWidget(self.lab_brush)
+
         self.lab_target = QLabel("目标")
         self.combo_target = QComboBox()
         self.combo_target.addItems(["像素", "蒙版"])
@@ -273,6 +288,26 @@ class ToolOptions(QToolBar):
             "bold": bool(self.font_bold),
             "color": list(self.text_swatch.rgb()),
         }
+
+    # ---------- 笔刷 ----------
+
+    def brush_params(self):
+        """进阶笔刷参数（给 canvas_view 建 Stroke 用）。"""
+        return dict(self.brush)
+
+    def refresh_brush_summary(self):
+        from .brush_dialog import summary_text
+        self.lab_brush.setText(summary_text(self.brush))
+
+    def open_brush_dialog(self):
+        from .brush_dialog import BrushDialog
+        dlg = BrushDialog(self, self.brush, size=self.size,
+                          hardness=self.hardness)
+        if dlg.exec() != QDialog.Accepted:
+            return False
+        self.brush = dlg.result_params()
+        self.refresh_brush_summary()
+        return True
 
     def set_tool(self, tool):
         """注意：QToolBar 里必须隐藏 action，直接 setVisible 在小组件上会被工具栏覆盖。"""

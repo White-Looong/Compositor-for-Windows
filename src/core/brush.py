@@ -3,32 +3,81 @@
 
 这里只做"把一个已知强度阵列 a 盖到目标数组上"的活儿；
 强度怎么算（流量、不透明度上限、选区限制）由 paint.py 负责。
+
+笔尖的形状由 `make_stamp()` 生成：圆 / 方 / 菱形，可以再叠「圆度」拉成椭圆、
+按「角度」旋转；`texture_patch()` 按**源坐标**取一张图案给画笔当纹理用。
 """
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
+
+# 笔尖形状
+SHAPES = ["圆形", "方形", "菱形"]
+# 纹理（无 + 复用图层样式那套内置图案，见 core/effects.py）
+TEXTURES = ["无", "点阵", "网格", "斜纹", "棋盘", "噪声"]
+
+# 笔刷设置默认值（工具选项条 / 笔刷对话框读写的就是这份）
+BRUSH_DEFAULTS = {
+    "shape": "圆形",
+    "roundness": 1.0,          # 5%~100%，越小笔尖越扁（椭圆）
+    "angle": 0.0,              # -180~180 度，笔尖旋转
+    "spacing": 0.25,           # 1%~500%，**笔尖直径**的百分之几（PS 语义）
+    "scatter": 0.0,            # 0%~1000%，以半径为单位的随机偏移
+    "count": 1,                # 1~10，每步落几个点
+    "size_jitter": 0.0,        # 0%~100%，大小随机抖动
+    "texture": "无",
+    "texture_scale": 24.0,     # 纹理周期（源像素）
+    "texture_depth": 0.5,      # 0%~100%，纹理的深浅
+    "airbrush": False,         # 喷枪：按住不动会持续加深
+    "air_rate": 12.0,          # 喷枪每秒补几笔
+    "pressure": "关",           # 关 / 大小 / 不透明度 / 大小+不透明度
+    "pressure_amount": 1.0,    # 0%~100%，模拟压感的强度
+}
+PRESSURE_MODES = ["关", "大小", "不透明度", "大小+不透明度"]
 
 _stamp_cache = {}
 
 
-def make_stamp(radius, hardness):
+def make_stamp(radius, hardness, shape="圆形", roundness=1.0, angle=0.0):
     """生成一个 (n,n) 的笔刷图章，值域 0~1。
 
-    radius:   半径（像素），小于 0.5 时按 0.5 处理
-    hardness: 0=极软，1=硬边
+    radius:    半径（像素），小于 0.5 时按 0.5 处理
+    hardness:  0=极软，1=硬边
+    shape:     圆形 / 方形 / 菱形
+    roundness: 0.05~1，把笔尖沿旋转后的一个轴压扁 -> 椭圆笔尖
+    angle:     笔尖旋转角度（度）
     """
     r = max(0.5, float(radius))
     h = float(np.clip(hardness, 0.0, 1.0))
+    rn = float(np.clip(roundness, 0.05, 1.0))
+    ang = float(angle) % 360.0
     n = int(max(1, round(r * 2)))
-    key = (n, round(h, 3))
+    key = (n, round(h, 3), shape, round(rn, 3), round(ang, 1))
     s = _stamp_cache.get(key)
     if s is not None:
         return s
 
     ax = np.arange(n, dtype=np.float32) - (n - 1) / 2.0
     yy, xx = np.meshgrid(ax, ax, indexing="ij")
-    d = np.sqrt(xx * xx + yy * yy) / r          # 0 中心，1 边缘
+    if ang:
+        t = math.radians(ang)
+        ct, st = math.cos(t), math.sin(t)
+        xr = xx * ct + yy * st
+        yr = -xx * st + yy * ct
+    else:
+        xr, yr = xx, yy
+    xr = xr / r
+    yr = yr / max(r * rn, 1e-6)
+
+    if shape == "方形":                       # 切比雪夫距离 = 正方形
+        d = np.maximum(np.abs(xr), np.abs(yr))
+    elif shape == "菱形":                     # 曼哈顿距离 = 菱形
+        d = np.abs(xr) + np.abs(yr)
+    else:
+        d = np.sqrt(xr * xr + yr * yr)
 
     if h >= 0.995:
         a = (d <= 1.0).astype(np.float32)
@@ -38,6 +87,23 @@ def make_stamp(radius, hardness):
     a[d > 1.0] = 0.0
     _stamp_cache[key] = a
     return a
+
+
+def stamp_cache_size():
+    """给测试用：看看图章缓存有没有无限膨胀。"""
+    return len(_stamp_cache)
+
+
+def texture_patch(shape, origin, kind, scale):
+    """按**源坐标**取一张图案，作为笔刷纹理。
+
+    图案锚在图像上而不是跟着笔尖走 —— 和 Photoshop 的「纹理」一样，
+    同一笔划过去图案是连续的，不会"游动"。
+    `origin` 是这块 patch 左上角在源坐标里的位置。
+    """
+    from .effects import pattern_mask
+    return pattern_mask(shape, (float(origin[0]), float(origin[1]), 0.0, 0.0),
+                        kind, float(scale))
 
 
 def _overlap(img_shape, cx, cy, n):

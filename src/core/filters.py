@@ -155,11 +155,50 @@ def f_radial(rgb, a, p):
     return _unpremul(pm2, a2), a2
 
 
-def f_median(rgb, a, p):
-    """中间值。OpenCV 的 medianBlur 对 float32 只支持 3x3 / 5x5。"""
-    r = int(max(1, min(2, p["radius"])))
+# ---------------------------------------------------------------- 中间值 / 蒙尘与划痕
+
+# 半径不超过这个值时走 float32 的 medianBlur（精确、无量化）
+_MEDIAN_FLOAT_R = 2
+# 半径上限 100 -> 核 201。实测 8-bit 路径在 k <= 201 时对任意图像尺寸都安全
+# （再大 OpenCV 的 AVX2 快速路径会断言失败，所以别把上限提到 100 以上）
+_MEDIAN_MAX_R = 100
+
+
+def _median_rgb(rgb, r):
+    """任意半径的 3 通道中间值（半径 1~_MEDIAN_MAX_R）。"""
+    r = int(max(1, min(_MEDIAN_MAX_R, r)))
     k = 2 * r + 1
-    out = np.stack([cv2.medianBlur(rgb[..., i], k) for i in range(3)], axis=-1)
+    if r <= _MEDIAN_FLOAT_R:
+        return np.stack([cv2.medianBlur(rgb[..., i], k) for i in range(3)],
+                        axis=-1)
+    u = np.clip(rgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return cv2.medianBlur(u, k).astype(np.float32) / 255.0
+
+
+def f_median(rgb, a, p):
+    """中间值。半径 1~100。
+
+    OpenCV 的 `medianBlur` 对 **float32** 只支持 3x3 / 5x5（半径 1~2），
+    但对 **uint8 支持任意奇数核**（内部是 Huang 的滑动直方图，核越大几乎不变慢：
+    12 MP 上半径 100 也只要 ~200 ms）。所以半径 > 2 时把三个通道量化到 8-bit 再算。
+    管线本来就在 8-bit 上收尾，量化误差最多 1/255，肉眼不可见。
+    小半径仍走 float32 路径 —— 那两个尺寸 OpenCV 算得又准又快，没必要量化。
+    """
+    r = int(max(1, p["radius"]))
+    return np.clip(_median_rgb(rgb, r), 0.0, 1.0), a
+
+
+def f_dust(rgb, a, p):
+    """蒙尘与划痕：只有偏离中间值超过阈值的像素才被替换，其余原样保留。
+
+    阈值 = 0 时退化成纯粹的中间值滤镜。判定**按通道**做（和 Photoshop 一致）。
+    适合去扫描件的灰尘、划痕、孤立噪点 —— 半径给大也不会把细节糊掉，
+    因为没超阈值的像素根本不动。
+    """
+    r = int(max(1, p["radius"]))
+    thr = float(p["threshold"]) / 255.0
+    med = _median_rgb(rgb, r)
+    out = np.where(np.abs(rgb - med) > thr, med, rgb)
     return np.clip(out, 0.0, 1.0), a
 
 
@@ -279,8 +318,13 @@ _register(FSpec("sharpen", "USM 锐化…", [
 ], f_sharpen))
 
 _register(FSpec("median", "中间值…", [
-    FParam("radius", "半径", "int", 1, 2, 1, spatial=True),
+    FParam("radius", "半径", "int", 1, _MEDIAN_MAX_R, 1, spatial=True),
 ], f_median))
+
+_register(FSpec("dust", "蒙尘与划痕…", [
+    FParam("radius", "半径", "int", 1, _MEDIAN_MAX_R, 3, spatial=True),
+    FParam("threshold", "阈值", "int", 0, 255, 20),
+], f_dust))
 
 _register(FSpec("noise", "添加杂色…", [
     FParam("amount", "数量", "int", 0, 100, 12),

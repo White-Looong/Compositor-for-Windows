@@ -125,6 +125,26 @@ def save_project(doc, path):
                                           layers=[to_dict_with_keys(l)
                                                   for l in c.layers])
 
+    # 通道面板的 Alpha 通道遮罩：和图层蒙版一样存成单通道 PNG。
+    # 注意 key 要在 to_dict 之前写好 —— 通道的 dict 里带的是这个相对路径。
+    if getattr(doc, "channels", None):
+        chd = dict(manifest.get("channels") or {})
+        entries = []
+        for c in doc.channels:
+            key = "channels/%s.png" % c.id
+            images[key] = c.mask
+            entries.append({"id": c.id, "key": key})
+        chd["masks"] = entries
+        manifest["channels"] = chd
+    # "合并的 Alpha 通道"也是一张遮罩，一起存
+    ca = getattr(doc, "composite_alpha", None)
+    if ca is not None:
+        key = "channels/_composite.png"
+        images[key] = ca
+        chd = dict(manifest.get("channels") or {})
+        chd["composite"] = key
+        manifest["channels"] = chd
+
     tmp = path + ".tmp"
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("manifest.json",
@@ -151,6 +171,14 @@ def load_project(path):
             images[name] = np.array(im)
     from .document import Document
     doc = Document.from_dict(manifest, images)
+    # from_dict 已经按 id 把通道遮罩换回数组了；这里只补"合并的 Alpha 通道"
+    # （它不是 Channel 对象，所以不走 channels.from_dict）
+    ckey = (manifest.get("channels") or {}).get("composite")
+    if ckey and ckey in images:
+        arr = np.asarray(images[ckey])
+        if arr.ndim == 3:
+            arr = arr[..., 3] if arr.shape[2] == 4 else arr[..., 0]
+        doc.composite_alpha = np.ascontiguousarray(arr.astype(np.uint8))
     doc.path = path
     return doc
 

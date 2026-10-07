@@ -33,13 +33,17 @@ class Param:
         choice         下拉框
         curve          曲线编辑器
         color          颜色按钮（值为 [r,g,b] 0~255）
+        gradient       渐变条编辑器（值为 [[位置, r, g, b], ...]，位置 0~1）
         keyed          分组数值：值形如 {分组名: {子键: 数值}}，
                        面板上用下拉框选分组、下面挂一组滑块
+
+    preset_map 是给 choice 用的可选字段：{选项名: {其它参数键: 值}}。
+    面板选中某一项时会把映射里的值一并写进参数（黑白预设就是这么做的）。
     """
 
     def __init__(self, key, label, kind="double", lo=0.0, hi=1.0,
                  default=0.0, step=1.0, choices=None, decimals=2,
-                 keys=None, sub=None):
+                 keys=None, sub=None, preset_map=None):
         self.key = key
         self.label = label
         self.kind = kind
@@ -52,6 +56,8 @@ class Param:
         # keyed 专用：分组名列表 + 每组的子参数
         self.keys = list(keys or [])
         self.sub = list(sub or [])
+        # choice 专用：选中某项时要一并写入的其它参数
+        self.preset_map = dict(preset_map or {})
         # 滑块用整数走，double 乘这个系数后再除回去
         self.scale = 1000 if kind == "double" else 1
 
@@ -232,19 +238,56 @@ def _vibrance(rgb, p):
 
 # ---------------------------------------------------------------- 色相 / 饱和度
 
+# 分色彩范围的六个色相族：显示名 -> 中心角（度）
+HS_RANGES = [("红色", 0.0), ("黄色", 60.0), ("绿色", 120.0),
+             ("青色", 180.0), ("蓝色", 240.0), ("洋红", 300.0)]
+HS_RANGE_NAMES = dict(HS_RANGES)
+HS_FULL = "全图"
+_HS_CORE = 15.0     # 完全生效的半宽（度）
+_HS_FALL = 30.0     # 核心之外再线性衰减的宽度（度）
+
+
+def hue_band_weight(h_deg, center):
+    """色相 h（0~360 环形）离中心 center 的颜色带权重：核内 1，核外线性到 0。
+
+    带宽取 PS 的默认感觉：全效区 ±15°，过渡区再 ±30°（相邻族之间有重叠，
+    处于过渡带的像素会同时拿到两边的部分权重，这正是 PS 的行为）。
+    """
+    d = np.abs((h_deg - center + 180.0) % 360.0 - 180.0)     # 0~180 环形距离
+    return np.clip((_HS_CORE + _HS_FALL - d) / _HS_FALL, 0.0, 1.0)
+
+
 def _hue_sat(rgb, p):
     hsv = _hsv(rgb)
     hue = float(p["hue"])
     sat = float(p["saturation"]) / 100.0
     light = float(p["lightness"]) / 100.0
+    rng = p.get("range", HS_FULL)
+
     if p.get("colorize"):
         # 着色：色相滑块直接当目标色相，饱和度滑块当着色浓度
         hsv[..., 0] = hue % 360.0
         hsv[..., 1] = np.clip(abs(sat), 0.0, 1.0)
-    else:
+        hsv[..., 2] = np.clip(hsv[..., 2] * (1.0 + light), 0.0, 1.0)
+        return _rgb(hsv)
+
+    # 分色彩范围：只有落在该色相带里的像素才被动，灰像素色相不可靠，
+    # 按饱和度做一层软门控（避免把中性灰也当成红色去推移）
+    w = None
+    center = HS_RANGE_NAMES.get(rng)
+    if center is not None:
+        w = hue_band_weight(hsv[..., 0], center)
+        w = w * np.clip(hsv[..., 1] / 0.12, 0.0, 1.0)
+
+    if w is None:
         hsv[..., 0] = (hsv[..., 0] + hue) % 360.0
         hsv[..., 1] = np.clip(hsv[..., 1] * (1.0 + sat), 0.0, 1.0)
-    hsv[..., 2] = np.clip(hsv[..., 2] * (1.0 + light), 0.0, 1.0)
+        hsv[..., 2] = np.clip(hsv[..., 2] * (1.0 + light), 0.0, 1.0)
+    else:
+        # w 已经是 (h,w)，**不要**加 [..., None]：那样会和 (h,w) 广播成 (h,w,h)
+        hsv[..., 0] = (hsv[..., 0] + w * hue) % 360.0
+        hsv[..., 1] = np.clip(hsv[..., 1] * (1.0 + w * sat), 0.0, 1.0)
+        hsv[..., 2] = np.clip(hsv[..., 2] * (1.0 + w * light), 0.0, 1.0)
     return _rgb(hsv)
 
 
@@ -252,6 +295,29 @@ def _hue_sat(rgb, p):
 
 _BW_KEYS = ["reds", "yellows", "greens", "cyans", "blues", "magentas"]
 _BW_ANCHORS = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0]
+
+# 黑白预设：名字 -> 六个滑块的值（顺序同 _BW_KEYS）。
+# 「自定义」= 全 0 = 恒等，所以新建的黑白层不会改变画面（§4.3 第 15 条）。
+# 数值是**近似**还原 PS 那几个常用预置的观感，不是逐位复刻。
+BW_PRESETS = {
+    "自定义": (0, 0, 0, 0, 0, 0),
+    "默认": (40, 60, 40, 60, 20, 80),
+    "较亮": (30, 30, 30, 30, 30, 30),
+    "较暗": (-30, -30, -30, -30, -30, -30),
+    "高对比度": (60, 80, 20, 40, -40, 70),
+    "低对比度": (15, 15, 15, 15, 15, 15),
+    "红色滤镜": (120, -30, -70, -50, -60, 20),
+    "黄色滤镜": (20, 120, 30, -40, -70, -20),
+    "绿色滤镜": (-70, 30, 120, 70, -30, -50),
+    "蓝色滤镜": (-60, -40, 20, 70, 120, 40),
+    "红外线": (-50, 70, 90, 60, 20, 30),
+    "最大黑色": (-100, -100, -100, -100, -100, -100),
+    "最大白色": (200, 200, 200, 200, 200, 200),
+}
+
+BW_PRESET_MAP = dict(
+    (name, dict(zip(_BW_KEYS, vals))) for name, vals in BW_PRESETS.items())
+BW_CUSTOM = "自定义"
 
 
 def _black_white(rgb, p):
@@ -375,18 +441,74 @@ def _channel_mixer(rgb, p):
 
 # ---------------------------------------------------------------- 渐变映射
 
-def _gradient_map(rgb, p):
-    """按亮度把图像映射到一条三段渐变（暗部 / 中间 / 亮部）上。
+# 位置（0~1）+ RGB（0~255）的控制点列表。默认是「黑 → 中灰 → 白」的线性灰度，
+# 和最早的 low / mid / high 三段版本等价，所以新建的渐变映射依然是恒等灰阶。
+GRADIENT_DEFAULT_STOPS = [[0.0, 0, 0, 0], [0.5, 128, 128, 128], [1.0, 255, 255, 255]]
 
-    用 Rec.601 亮度取 t，暗部->中间段走 t*2，中间->亮部段走 (t-0.5)*2。
-    比直接按通道插值更稳：不会把彩色高光压成纯色块。
+
+def normalize_stops(stops):
+    """整理控制点：补默认、排序、位置夹到 0~1、去掉过近的重复点。"""
+    out = []
+    for s in (stops or []):
+        try:
+            pos = min(1.0, max(0.0, float(s[0])))
+            col = [int(min(255, max(0, round(float(c))))) for c in s[1:4]]
+        except (TypeError, ValueError, IndexError):
+            continue
+        out.append([pos] + (col + [0, 0, 0])[:3])
+    if not out:
+        return [list(s) for s in GRADIENT_DEFAULT_STOPS]
+    out.sort(key=lambda q: q[0])
+    # 位置差了不到 1/512 的点合并（否则插值会出现除零一类的数值噪声）
+    dedup = [out[0]]
+    for q in out[1:]:
+        if q[0] - dedup[-1][0] < 0.002:
+            dedup[-1] = q
+        else:
+            dedup.append(q)
+    if len(dedup) == 1:
+        c = dedup[0][1:]
+        dedup = [[0.0] + c, [1.0] + c]
+    return dedup
+
+
+def gradient_lut(stops, n=256):
+    """把控制点展开成 (n,3) 的 0~1 颜色表（分段线性）。UI 也用它画渐变条。"""
+    pts = normalize_stops(stops)
+    xs = np.array([q[0] for q in pts], np.float64)
+    cols = np.array([q[1:] for q in pts], np.float64) / 255.0
+    t = np.arange(n, dtype=np.float64) / (n - 1.0)
+    lut = np.empty((n, 3), np.float64)
+    for k in range(3):
+        lut[:, k] = np.interp(t, xs, cols[:, k])
+    return np.clip(lut, 0.0, 1.0)
+
+
+def legacy_stops(p):
+    """早期版本用 low / mid / high 三个颜色描述渐变，这里转成控制点列表。"""
+    lo = p.get("low") or [0, 0, 0]
+    mid = p.get("mid") or [128, 128, 128]
+    hi = p.get("high") or [255, 255, 255]
+
+    def col(c):
+        c = list(c)[:3]
+        return [float(x) for x in (c + [0, 0, 0])[:3]]
+
+    return [[0.0] + col(lo), [0.5] + col(mid), [1.0] + col(hi)]
+
+
+def _gradient_map(rgb, p):
+    """按亮度把图像映射到一条自定义渐变上。
+
+    用 Rec.601 亮度取 t，查 256 项 LUT。比直接按通道插值更稳：
+    不会把彩色高光压成纯色块。
     """
-    lo = np.asarray(p.get("low") or [0, 0, 0], np.float32) / 255.0
-    mid = np.asarray(p.get("mid") or [128, 128, 128], np.float32) / 255.0
-    hi = np.asarray(p.get("high") or [255, 255, 255], np.float32) / 255.0
-    t = np.clip(_luma(rgb), 0.0, 1.0)[..., None] * 2.0
-    return np.where(t < 1.0, lo + (mid - lo) * t,
-                    mid + (hi - mid) * (t - 1.0))
+    # stops 为空 = 旧工程（只有 low / mid / high）或还没被面板初始化过
+    stops = p.get("stops") or legacy_stops(p)
+    lut = gradient_lut(stops, 256).astype(np.float32)
+    t = np.clip(_luma(rgb), 0.0, 1.0)
+    idx = np.clip((t * 255.0 + 0.5).astype(np.int32), 0, 255)
+    return lut[idx]
 
 
 # ---------------------------------------------------------------- 照片滤镜
@@ -506,6 +628,8 @@ _register(_spec("vibrance", "自然饱和度", [
 ], _vibrance))
 
 _register(_spec("hue_sat", "色相/饱和度", [
+    Param("range", "色彩范围", "choice",
+          choices=[HS_FULL] + [n for n, _c in HS_RANGES], default=HS_FULL),
     Param("hue", "色相", "int", -180, 180, 0),
     Param("saturation", "饱和度", "int", -100, 100, 0),
     Param("lightness", "明度", "int", -100, 100, 0),
@@ -513,6 +637,8 @@ _register(_spec("hue_sat", "色相/饱和度", [
 ], _hue_sat))
 
 _register(_spec("black_white", "黑白", [
+    Param("preset", "预设", "choice", choices=list(BW_PRESETS.keys()),
+          default=BW_CUSTOM, preset_map=BW_PRESET_MAP),
     Param("reds", "红色", "int", -200, 200, 0),
     Param("yellows", "黄色", "int", -200, 200, 0),
     Param("greens", "绿色", "int", -200, 200, 0),
@@ -560,9 +686,8 @@ _register(_spec("channel_mixer", "通道混合器", [
 ], _channel_mixer, histogram=True))
 
 _register(_spec("gradient_map", "渐变映射", [
-    Param("low", "暗部", "color", default=[0, 0, 0]),
-    Param("mid", "中间", "color", default=[128, 128, 128]),
-    Param("high", "亮部", "color", default=[255, 255, 255]),
+    # 值为 None 时按旧工程的 low / mid / high 走，面板一打开就会补成控制点列表
+    Param("stops", "渐变", "gradient", default=None),
 ], _gradient_map, histogram=True))
 
 _register(_spec("photo_filter", "照片滤镜", [

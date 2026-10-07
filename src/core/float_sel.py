@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 from .layer import LAYER_IMAGE, Layer
-from .render import _warp_layer
+from .render import _warp_layer, _warp_straight
 
 
 def can_lift(doc, layer):
@@ -107,12 +107,15 @@ def erase_selection(doc, layer):
 
 
 def float_bbox(fl):
-    """浮动层在画布坐标下的矩形 (x0, y0, x1, y1)。"""
+    """浮动层在画布坐标下的矩形 (x0, y0, x1, y1)。
+
+    走 `Layer.bbox()` 而不是手算，因为浮动层**可以带变换** —— 拖手柄缩放
+    / 旋转过之后，包围盒要按变换后的四角算。不裁到画布内：浮到画布外的
+    内容也是内容，落定时照样要盖回图层。
+    """
     if fl is None or fl.image is None:
         return None
-    h, w = fl.image.shape[:2]
-    return (fl.tx - w / 2.0, fl.ty - h / 2.0,
-            fl.tx + w / 2.0, fl.ty + h / 2.0)
+    return fl.bbox()
 
 
 def stamp_float(doc, layer=None):
@@ -133,10 +136,29 @@ def stamp_float(doc, layer=None):
         doc.float_layer = None
         return False
 
-    fx0, fy0, fx1, fy1 = float_bbox(fl)
+    # 1) 浮动层（含它自己的变换）先渲成画布坐标系里的一块 RGBA
+    box = float_bbox(fl)
+    if box is None:
+        doc.float_layer = None
+        return False
+    x0 = int(np.floor(box[0]))
+    y0 = int(np.floor(box[1]))
+    x1 = int(np.ceil(box[2]))
+    y1 = int(np.ceil(box[3]))
+    w, h = x1 - x0, y1 - y0
+    if w <= 0 or h <= 0:
+        doc.float_layer = None
+        return False
+    Mf = fl.matrix(ox=x0, oy=y0)        # 浮动位图 -> 这块 patch
+    # 必须**先预乘 alpha 再插值**（§3.2）：直接对直线色做双线性，边缘会和
+    # 外面的透明黑（RGB=0）混出一条脏边。这里走渲染用的同一个函数
+    pc, pa = _warp_straight(fl.image, Mf, (w, h), cv2.INTER_LINEAR)
+    patch = np.concatenate([pc, pa], axis=2)
+
+    # 2) 这块 patch 覆盖到源图的哪个区域？四角反变换回去求包围盒
     Minv = cv2.invertAffineTransform(M)
-    pts = np.array([[fx0, fy0, 1.0], [fx1, fy0, 1.0],
-                    [fx1, fy1, 1.0], [fx0, fy1, 1.0]], np.float64)
+    pts = np.array([[x0, y0, 1.0], [x1, y0, 1.0],
+                    [x1, y1, 1.0], [x0, y1, 1.0]], np.float64)
     sp = pts @ Minv.T                       # 浮动层四角 -> 源坐标
     H, W = layer.image.shape[:2]
     sx0 = max(0, int(np.floor(sp[:, 0].min())) - 2)
@@ -146,20 +168,21 @@ def stamp_float(doc, layer=None):
     if sx1 <= sx0 or sy1 <= sy0:
         doc.float_layer = None
         return False
+    sw, sh = sx1 - sx0, sy1 - sy0
 
+    # 3) patch -> 源坐标。
+    #    注意 warpAffine 不加 WARP_INVERSE_MAP 时算的是 dst(p) = src(M⁻¹·p)
+    #    （§4.3-13），也就是"传进去的矩阵被当作 dst->src"。所以先拼出
+    #    **源图坐标 -> patch 坐标** 的正向矩阵再求逆，别直接把正向的传进去
     a, c, tx = M[0, 0], M[0, 1], M[0, 2]
     b, d, ty = M[1, 0], M[1, 1], M[1, 2]
-    xs = np.arange(sx0, sx1, dtype=np.float32) + 0.5
-    ys = np.arange(sy0, sy1, dtype=np.float32) + 0.5
-    X, Y = np.meshgrid(xs, ys)
-    mapx = (a * X + c * Y + tx - fx0).astype(np.float32)
-    mapy = (b * X + d * Y + ty - fy0).astype(np.float32)
-    src = cv2.remap(fl.image, mapx, mapy, cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=(0, 0, 0, 0))
+    fwd = np.array([[a, c, a * sx0 + c * sy0 + tx - x0],
+                    [b, d, b * sx0 + d * sy0 + ty - y0]], np.float64)
+    sc, sa_ = _warp_straight(patch * 255.0, cv2.invertAffineTransform(fwd),
+                             (sw, sh), cv2.INTER_LINEAR)
+    s = np.concatenate([sc, sa_], axis=2)
 
     dst = layer.image[sy0:sy1, sx0:sx1].astype(np.float32) / 255.0
-    s = src.astype(np.float32) / 255.0
     sa = s[..., 3:4]
     da = dst[..., 3:4]
     oa = np.clip(sa + da * (1.0 - sa), 0.0, 1.0)
