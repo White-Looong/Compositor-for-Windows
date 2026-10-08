@@ -10,9 +10,13 @@
                   改参数就重新生成，所以是非破坏性的；想改像素得先栅格化
   * smart      —— 智能对象，自身不存像素，引用一段嵌入内容（core.smart），
                   渲染时才合成；内容可以独立编辑，滤镜是参数化的（智能滤镜）
+  * shape      —— 矢量形状图层，像素由路径参数（core.shape）栅格化生成。
+                  位图是**按当前缩放现画的**（画完把 sx/sy 归 1），
+                  所以放大缩小不糊；改颜色 / 圆角 / 边数都只是重画一次
 
 变换（tx/ty/sx/sy/rot/flip）是**非破坏性**的：位图始终以原始分辨率保存，
-只在渲染时做仿射变换，所以缩放再放大不会丢细节。
+只在渲染时做仿射变换，所以缩放再放大不会丢细节。形状图层更进一步 ——
+缩放会直接换一个分辨率重画（见 core.shape）。
 """
 
 from __future__ import annotations
@@ -30,9 +34,14 @@ LAYER_GROUP = "group"
 LAYER_ADJUSTMENT = "adjustment"
 LAYER_TEXT = "text"
 LAYER_SMART = "smart"
+LAYER_SHAPE = "shape"
 
 # 这几种图层有像素（或像素是派生出来的），可以按位图图层参与合成
-PIXEL_KINDS = (LAYER_IMAGE, LAYER_TEXT, LAYER_SMART)
+PIXEL_KINDS = (LAYER_IMAGE, LAYER_TEXT, LAYER_SMART, LAYER_SHAPE)
+
+# 这几种图层的 image 是**派生**的（由参数算出来），不进工程文件：
+# 存了必然过期，还白白占体积
+DERIVED_KINDS = (LAYER_SMART, LAYER_SHAPE)
 
 
 class Layer:
@@ -51,6 +60,7 @@ class Layer:
         self.mask = None            # (h,w) uint8，可选
         self.adjust = None          # 调整层：{"type": key, "params": {...}}
         self.text = None            # 文字层：参数 dict，见 core.text
+        self.shape = None           # 形状层：路径参数 dict，见 core.shape
         self.effects = None         # 图层样式：{效果 id: {enabled, ...}}，见 core.effects
         self.so_id = None           # 智能对象：嵌入内容的 id，见 core.smart
         self.so_filters = None      # 智能对象：智能滤镜列表 [{"key","params",...}]
@@ -87,6 +97,10 @@ class Layer:
     @property
     def is_smart(self):
         return self.kind == LAYER_SMART
+
+    @property
+    def is_shape(self):
+        return self.kind == LAYER_SHAPE
 
     @property
     def has_effects(self):
@@ -205,6 +219,7 @@ class Layer:
         # 调整层 / 文字层参数要深拷贝：历史快照不能被后续的参数改动带跑
         n.adjust = copy.deepcopy(self.adjust) if self.adjust else None
         n.text = copy.deepcopy(self.text) if self.text else None
+        n.shape = copy.deepcopy(self.shape) if self.shape else None
         n.effects = copy.deepcopy(self.effects) if self.effects else None
         n.so_id = self.so_id
         n.so_filters = (copy.deepcopy(self.so_filters)
@@ -257,6 +272,8 @@ class Layer:
             d["adjust"] = self.adjust
         if self.text:
             d["text"] = self.text
+        if self.shape:
+            d["shape"] = self.shape
         if self.effects:
             d["effects"] = self.effects
         if self.kind == LAYER_SMART:
@@ -295,6 +312,12 @@ class Layer:
                 lay.text = normalize_text_params(d["text"])
             except Exception:
                 lay.text = d["text"]
+        if d.get("shape"):
+            try:
+                from .shape import normalize_shape_params
+                lay.shape = normalize_shape_params(d["shape"])
+            except Exception:
+                lay.shape = d["shape"]
         if d.get("effects"):
             try:
                 from .effects import normalize_effects
@@ -304,9 +327,11 @@ class Layer:
         key = d.get("image")
         if key and key in images:
             lay.image = images[key]
-        if lay.kind == LAYER_SMART:
-            # 栅格是内容渲染出来的，读回来由 core.smart 重算，不进工程文件
+        if lay.kind in DERIVED_KINDS:
+            # 栅格是派生出来的（智能对象由内容合成、形状由路径参数画出来），
+            # 读回来由对应模块重算，不进工程文件
             lay.image = None
+        if lay.kind == LAYER_SMART:
             lay.so_id = d.get("so_id")
             lay.so_filters = d.get("so_filters") or []
         mkey = d.get("mask")

@@ -35,6 +35,7 @@ from .adjust import apply_adjustment
 from .blend import PASS_THROUGH, blend_colors, composite
 from .document import Document
 from .effects import apply_effects, effect_padding, scale_effects
+from .shape import sync_shape_image, sync_shapes
 from .smart import sync_smart
 
 
@@ -511,6 +512,7 @@ def render_document(doc, region=None, snap_layer=None, snap=None):
     if region is None:
         region = (0, 0, doc.width, doc.height)
     sync_smart(doc)                 # 智能对象：把派生的 image 填好
+    sync_shapes(doc)                # 矢量形状：按参数（与当前缩放）重画
     x0 = _clip(int(region[0]), 0, doc.width)
     y0 = _clip(int(region[1]), 0, doc.height)
     x1 = _clip(int(region[2]), 0, doc.width)
@@ -835,6 +837,7 @@ def render_region_tiled(doc, region, out=None, tile=None,
     if has_dissolve(doc):
         return None
     sync_smart(doc)
+    sync_shapes(doc)
     x0 = _clip(int(region[0]), 0, doc.width)
     y0 = _clip(int(region[1]), 0, doc.height)
     x1 = _clip(int(region[2]), 0, doc.width)
@@ -922,6 +925,7 @@ def render_layer_thumb(layer, size=40):
     """图层缩略图（不应用变换，只显示源图内容），返回 (n,n,4) uint8。"""
     if layer.is_group:
         return None
+    sync_shape_image(layer)         # 形状图层的位图是派生的
     if layer.image is None:
         return None
     img = layer.image

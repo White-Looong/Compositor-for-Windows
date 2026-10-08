@@ -15,6 +15,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtGui import QCloseEvent                    # noqa: E402
 from PySide6.QtWidgets import (QApplication, QComboBox,  # noqa: E402
                                QFileDialog, QSlider)
 
@@ -2217,6 +2218,279 @@ def main():
         assert len(picked) == (1 if hp is None else 2), picked
     print("  导入图片：SVG 按画布栅格化 / HEIC 缩放入画布 / 导入可一步撤销")
 
+    # ---------- 多标签页（第二十四批）----------
+    # 到这儿已经攒了好几个标签（每次 new_document 都是新开一个）
+    n0 = len(win.sessions)
+    assert n0 >= 2 and win.tabbar.count() == n0, (n0, win.tabbar.count())
+    assert win.tabbar.isVisible() and win.tabbar.tabsClosable()
+
+    # 1) 新建 = 新开一个标签，原来那份原封不动
+    i_prev = win._tab_index
+    doc_prev = win.doc
+    n_prev = len(doc_prev.layers)
+    win.new_document(640, 480, "标签测试A")
+    assert len(win.sessions) == n0 + 1, "新建应该新开一个标签"
+    assert win.doc is not doc_prev and win.doc.name == "标签测试A"
+    i_a = win._tab_index
+    hist_a = win.history
+    win._switch_to(i_prev)
+    assert win.doc is doc_prev and len(win.doc.layers) == n_prev, \
+        "切回原来那个标签，文档该原封不动"
+    assert win.history is not hist_a, "每个标签有自己的撤销栈"
+    win._switch_to(i_a)
+    assert win.doc.name == "标签测试A" and win.history is hist_a
+    assert "标签测试A" in win.windowTitle(), win.windowTitle()
+
+    # 2) 每个标签有自己的撤销栈、自己的选中图层
+    lay_a = Layer("A 的图层", "image", _img(200, 150, (30, 90, 200)))
+    lay_a.tx, lay_a.ty = win.doc.width / 2.0, win.doc.height / 2.0
+    win.doc.layers.append(lay_a)
+    win.select_layer(lay_a.id)
+    win.commit("add")
+    assert win.history.can_undo()
+    sel_a = win.selected_id
+    id_prev = win.sessions[i_prev].selected_id
+    win._switch_to(i_prev)
+    assert win.doc.find(lay_a.id) is None, "A 的图层不该出现在别的标签里"
+    n_prev2 = len(win.doc.layers)
+    assert win.selected_id == id_prev
+    win._switch_to(i_a)
+    assert win.history.can_undo() and win.doc.find(lay_a.id) is not None, \
+        "切回来 A 上的改动还在"
+    assert win.selected_id == sel_a, "选中图层也是按标签记的"
+    # 在 A 上撤销，别的标签不该跟着动
+    win.undo()
+    assert win.doc.find(lay_a.id) is None
+    win._switch_to(i_prev)
+    assert len(win.doc.layers) == n_prev2, "别处的撤销不该影响这一份"
+    win._switch_to(i_a)
+    win.redo()
+    assert win.doc.find(lay_a.id) is not None
+
+    # 3) 渲染结果与图层面板跟着当前标签走
+    win._do_render()
+    assert win._last_arr.shape[:2] == (win.doc.height, win.doc.width), \
+        win._last_arr.shape
+    win.panel.rebuild()
+    assert win.panel.tree.topLevelItemCount() == len(win.doc.layers), \
+        (win.panel.tree.topLevelItemCount(), len(win.doc.layers))
+    win._switch_to(i_prev)
+    win._do_render()
+    assert win._last_arr.shape[:2] == (win.doc.height, win.doc.width)
+    win.panel.rebuild()
+    assert win.panel.tree.topLevelItemCount() == len(win.doc.layers)
+    win._switch_to(i_a)
+
+    # 4) 缩放按标签各记一份
+    win.view.set_zoom(0.5)
+    z_a = win.view.zoom
+    win._switch_to(i_prev)
+    win.view.set_zoom(2.0)
+    assert abs(win.view.zoom - 2.0) < 1e-6
+    win._switch_to(i_a)
+    assert abs(win.view.zoom - z_a) < 1e-6, "缩放该按标签分别记住"
+
+    # 5) 改过没存：标签上打 *，存盘之后消失
+    assert win.sessions[i_a].dirty, "刚落了一个撤销点，该算「改过没存」"
+    assert win.tabbar.tabText(i_a).endswith(" *"), win.tabbar.tabText(i_a)
+    with tempfile.TemporaryDirectory() as d3:
+        p3 = os.path.join(d3, "tab_a.cwproj")
+        old_fn = QFileDialog.getSaveFileName
+        QFileDialog.getSaveFileName = lambda *a, **k: (p3, "")
+        try:
+            win.save_project_as()
+        finally:
+            QFileDialog.getSaveFileName = old_fn
+        assert os.path.getsize(p3) > 0
+    assert not win.sessions[i_a].dirty and win.doc.path == p3
+    assert not win.tabbar.tabText(i_a).endswith(" *"), win.tabbar.tabText(i_a)
+
+    # 6) 关掉别的标签，当前的不动
+    n1 = len(win.sessions)
+    assert win.close_tab(0, force=True), "force 关闭应该成功"
+    assert len(win.sessions) == n1 - 1 and win.tabbar.count() == n1 - 1
+    assert win.doc.name == "标签测试A"
+    i_a = win._tab_index
+
+    # 7) 有未保存改动时会先问；用户取消就真的不关
+    win.new_document(320, 240, "标签测试B")
+    i_b = win._tab_index
+    lay_b = Layer("B", "image", _img(80, 60, (200, 30, 30)))
+    lay_b.tx, lay_b.ty = 160.0, 120.0
+    win.doc.layers.append(lay_b)
+    win.commit("add")
+    asked = []
+
+    def _ask_cancel(i, s):
+        asked.append(i)
+        return False
+
+    def _ask_drop(i, s):
+        asked.append(i)
+        return True
+
+    win._ask_save_before_close = _ask_cancel
+    assert not win.close_tab(i_b), "用户取消就该不关"
+    assert asked == [i_b] and len(win.sessions) == n1, (asked, len(win.sessions))
+    win._ask_save_before_close = _ask_drop
+    assert win.close_tab(i_b), "确认丢弃就该关掉"
+    assert len(win.sessions) == n1 - 1 and len(asked) == 2
+    del win._ask_save_before_close          # 删掉实例属性，回到类上的实现
+
+    # 8) 关的是当前标签 -> 自动切到相邻那个
+    n2 = len(win.sessions)
+    cur = win._tab_index
+    assert win.close_tab(cur, force=True)
+    assert len(win.sessions) == n2 - 1
+    assert 0 <= win._tab_index < len(win.sessions)
+    assert win.tabbar.currentIndex() == win._tab_index, "标签栏与状态要一致"
+
+    # 9) Ctrl+Tab 绕圈 / 拖动标签改顺序
+    if len(win.sessions) < 2:
+        win.new_document(300, 200, "再补一个")
+    names = [s.doc.name for s in win.sessions]
+    i0 = win._tab_index
+    win.cycle_tab(1)
+    assert win._tab_index == (i0 + 1) % len(win.sessions)
+    win.cycle_tab(-1)
+    assert win._tab_index == i0
+    win.tabbar.moveTab(0, 1)
+    assert [s.doc.name for s in win.sessions] == \
+        [names[1], names[0]] + names[2:], "拖标签后会话顺序要跟着换"
+
+    # 10) 最后一个标签不许关（要关就关窗口）
+    while len(win.sessions) > 1:
+        assert win.close_tab(0, force=True)
+    assert len(win.sessions) == 1
+    assert not win.close_tab(0, force=True), "最后一个标签不该被关掉"
+    assert len(win.sessions) == 1
+
+    from src.ui.main_window import SmartObjectEditor
+    assert MainWindow._tabbed is True and SmartObjectEditor._tabbed is False, \
+        "智能对象编辑窗口是单文档的，不该有标签栏"
+    # 11) 关窗口：有未保存的会逐个问（离屏下真弹窗会挂死，这里换成打桩）
+    win.new_document(200, 150, "未保存C")
+    lay_c = Layer("C", "image", _img(60, 40, (10, 220, 10)))
+    lay_c.tx, lay_c.ty = 100.0, 75.0
+    win.doc.layers.append(lay_c)
+    win.commit("add")
+    asked = []
+    win._ask_save_before_close = _ask_cancel
+    ev = QCloseEvent()
+    win.closeEvent(ev)
+    assert asked, "关窗口前该把没存的文档逐个问一遍"
+    assert not ev.isAccepted(), "取消保存就该关不掉窗口"
+    win._ask_save_before_close = _ask_drop
+    ev2 = QCloseEvent()
+    win.closeEvent(ev2)
+    assert ev2.isAccepted(), "都确认丢弃之后该允许关闭"
+    del win._ask_save_before_close
+    print("  多标签页：新建即新标签 / 撤销栈与选中按标签隔离 / 缩放各记一份 / "
+          "改过没存打 * / 关标签与关窗口前询问 / 最后一张不许关")
+
+    # ---------- 结构性改动的脏区 + 显示质量（第二十五批）----------
+    from PySide6.QtCore import Qt as _Qt
+    from src.core.document import make_adjustment_layer
+    from src.ui.channels_panel import ChannelsPanel
+
+    d25 = Document(1200, 800, "脏区验证")
+    d25.layers.append(make_image_layer("背景", _img(1200, 800, (235, 235, 240)),
+                                       1200, 800))
+    for i in range(3):
+        L = make_image_layer("L%d" % i,
+                             _img(500, 400, (60 + i * 60, 200 - i * 40, 80 + i * 30)),
+                             1200, 800)
+        L.tx, L.ty = 300.0 + i * 250, 300.0 + i * 60
+        L.sx = L.sy = 0.8
+        if i == 1:                      # 中间那层带投影：脏区要含效果外扩
+            L.effects = {"drop_shadow": {"on": True, "distance": 18, "size": 12,
+                                         "angle": 45, "opacity": 0.7,
+                                         "color": (0, 0, 0)}}
+        d25.layers.append(L)
+    win.set_document(d25, reset_history=True)
+    win.view.fit()
+    win._do_render()
+
+    def dirty_check(label, fn):
+        """走一次改动：断言只重算了脏区，且结果与整幅**逐位一致**。"""
+        fn()
+        win._do_render()
+        p = win._last_pass
+        a1 = win._last_arr.copy()
+        win.mark_dirty(None)
+        win._do_render()
+        d = np.abs(a1.astype(np.int16) - win._last_arr.astype(np.int16))
+        assert d.max() <= 1, "%s：局部与整幅差 %d" % (label, d.max())
+        return p
+
+    top25 = d25.layers[-1]
+    for label, fn in (
+        ("切可见性", lambda: (setattr(top25, "visible", not top25.visible),
+                              win.commit(),
+                              win.request_render(win.layer_dirty_rect(top25)))),
+        ("改混合模式", lambda: (setattr(top25, "blend", "Multiply"), win.commit(),
+                                win.request_render(win.layer_dirty_rect(top25)))),
+        ("改不透明度", lambda: (setattr(top25, "opacity", 0.4), win.commit(),
+                                win.request_render(win.layer_dirty_rect(top25)))),
+        ("蒙版", lambda: (win.select_layer(top25.id), win.add_mask("alpha"))),
+        ("删除图层", lambda: (win.select_layer(d25.layers[-1].id),
+                              win.delete_layer())),
+    ):
+        assert dirty_check(label, fn) == "partial", "%s 该走脏区" % label
+
+    # 有调整层 / 选中调整层时必须退回整幅（调整层作用于下方全部内容）
+    d25b = Document(600, 400, "有调整层")
+    d25b.layers.append(make_image_layer("底", _img(600, 400, (120, 120, 200)),
+                                        600, 400))
+    d25b.layers.append(make_adjustment_layer("invert"))
+    win.set_document(d25b, reset_history=True)
+    win._do_render()
+    assert win.layer_dirty_rect(d25b.layers[0]) is None, \
+        "上方有调整层就不能只算脏区"
+    assert win.layer_dirty_rect(d25b.layers[-1]) is None, "选中调整层也要整幅"
+    d25b.layers[0].opacity = 0.5
+    win.request_render(win.layer_dirty_rect(d25b.layers[0]))
+    win._do_render()
+    assert win._last_pass in ("full", "tiled"), win._last_pass
+
+    # 显示：缩小时平滑、放大看真实像素；代理图（要放大回来）必须平滑
+    win.view.set_zoom(0.5)
+    assert win.view.pix_item.transformationMode() == _Qt.SmoothTransformation
+    win.view.set_zoom(2.0)
+    assert win.view.pix_item.transformationMode() == _Qt.FastTransformation
+    win.view.set_zoom(1.0)
+    win._show(np.zeros((40, 60, 4), np.uint8), scale=(0.25, 0.25))
+    assert win.view.pix_item.transformationMode() == _Qt.SmoothTransformation
+    win._show(np.zeros((400, 600, 4), np.uint8))
+    assert win.view.pix_item.transformationMode() == _Qt.FastTransformation
+
+    # 通道缩略图：面板藏起来不算（原来 86 ms/次照算不误），露出来补一次
+    calls = []
+    _orig_sr = ChannelsPanel.set_render
+    ChannelsPanel.set_render = lambda self, arr: (calls.append(1),
+                                                  _orig_sr(self, arr))
+    win.mark_dirty(None)
+    win._do_render()
+    app.processEvents()
+    app.processEvents()
+    win.channels_dock.hide()
+    app.processEvents()
+    calls.clear()
+    win.mark_dirty(None)
+    win._do_render()
+    app.processEvents()
+    app.processEvents()
+    assert len(calls) == 0, "面板藏起来时不该算缩略图，实际算了 %d 次" % len(calls)
+    win.channels_dock.show()
+    app.processEvents()
+    app.processEvents()
+    assert len(calls) >= 1, "面板露出来要补一次缩略图"
+    ChannelsPanel.set_render = _orig_sr
+    print("  交互延迟 / 清晰度：结构性改动只重算脏区（与整幅逐位一致）/ "
+          "有调整层退回整幅 / 缩放与代理图走平滑 / 缩略图面板藏起时不算")
+
+    for s in win.sessions:
+        s.mark_saved()                  # 剩下的都当存过了，别在收尾时弹窗
     win.set_document(Document(1280, 800), reset_history=True)
     win.close()
     print("界面冒烟测试全部通过。")

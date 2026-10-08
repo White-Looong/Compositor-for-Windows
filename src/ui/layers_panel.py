@@ -70,6 +70,26 @@ def _text_icon(size=32):
     return QIcon(pm)
 
 
+def _shape_icon(size=32):
+    """矢量形状图层图标：方框 + 圆 + 锚点（PS 用类似的小方块加锚点）。"""
+    pm = QPixmap(QSize(size, size))
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(QPen(QColor(150, 150, 158), 1.2))
+    p.setBrush(QBrush(QColor(226, 92, 84)))
+    p.drawEllipse(4, 4, size - 15, size - 15)
+    p.setBrush(Qt.NoBrush)
+    p.drawRect(11, 11, size - 15, size - 15)
+    p.setBrush(QBrush(QColor(235, 235, 240)))
+    p.setPen(Qt.NoPen)
+    for x, y in ((4, 4), (size - 11, 4), (4, size - 11),
+                 (size - 11, size - 11)):
+        p.drawEllipse(x - 1, y - 1, 3, 3)
+    p.end()
+    return QIcon(pm)
+
+
 def _smart_icon(size=32):
     """智能对象图标：右下角带折角标记的方块（和 Photoshop 的角标一个意思）。"""
     pm = QPixmap(QSize(size, size))
@@ -106,8 +126,10 @@ class LayersPanel(QWidget):
         self._folder_icon = _folder_icon()
         self._adjust_icon = _adjust_icon()
         self._text_icon = _text_icon()
+        self._shape_icon = _shape_icon()
         self._smart_icon = _smart_icon()
         self._smart_badge = _smart_icon(14)
+        self._shape_badge = _shape_icon(14)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
@@ -265,6 +287,19 @@ class LayersPanel(QWidget):
             it.setIcon(0, self._adjust_icon)
         elif layer.is_text:
             it.setIcon(0, self._text_icon)
+        elif layer.is_shape:
+            # 形状的位图是派生出来的，一样能出缩略图；右下角叠个形状角标
+            thumb = render_layer_thumb(layer, 28)
+            if thumb is not None:
+                base = _arr_to_icon(np.ascontiguousarray(thumb), 28)
+                pm = base.pixmap(QSize(28, 28))
+                p = QPainter(pm)
+                p.setRenderHint(QPainter.Antialiasing)
+                p.drawPixmap(14, 14, self._shape_badge.pixmap(QSize(14, 14)))
+                p.end()
+                it.setIcon(0, QIcon(pm))
+            else:
+                it.setIcon(0, self._shape_icon)
         elif layer.is_smart:
             # 缩略图上面叠一层智能对象角标：既能预览内容，又看得出它是智能对象
             thumb = render_layer_thumb(layer, 28)
@@ -290,6 +325,8 @@ class LayersPanel(QWidget):
         if layer.is_smart:
             n = len(layer.so_filters or [])
             tags.append("智能滤镜 x%d" % n if n else "智能对象")
+        if layer.is_shape:
+            tags.append("形状")
         if tags:
             it.setText(0, "%s   [%s]" % (layer.name, "/".join(tags)))
         it.setSizeHint(0, QSize(0, 32))
@@ -388,7 +425,7 @@ class LayersPanel(QWidget):
             if vis != layer.visible:
                 layer.visible = vis
                 self.main.commit("切换可见性")
-                self.main.request_render()
+                self.main.request_render(self.main.layer_dirty_rect(layer))
 
     def _on_blend(self, text):
         if self._building:
@@ -398,7 +435,7 @@ class LayersPanel(QWidget):
             return
         layer.blend = text
         self.main.commit("混合模式")
-        self.main.request_render()
+        self.main.request_render(self.main.layer_dirty_rect(layer))
 
     def _on_opacity(self, value):
         if self._building:

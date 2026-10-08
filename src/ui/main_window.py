@@ -3,30 +3,32 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 import uuid
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QDockWidget,
                                QFileDialog, QFormLayout, QInputDialog, QLabel,
-                               QMainWindow, QMessageBox, QScrollArea, QSpinBox,
-                               QToolBar)
+                               QMainWindow, QMenu, QMessageBox, QScrollArea,
+                               QSpinBox, QTabBar, QToolBar, QVBoxLayout, QWidget)
 
 from ..core.adjust import ADJUSTMENTS, ADJUST_ORDER
 from ..core.brush import clear_rgba, fill_rgba
 from ..core.document import (Document, make_adjustment_layer, make_group,
-                             make_image_layer, make_text_layer)
+                             make_image_layer, make_shape_layer,
+                             make_text_layer)
 from ..core.content_aware import (extend_canvas_content_aware,
                                   fill_content_aware)
 from ..core.filters import (FILTERS, FILTER_ORDER, apply_filter_array,
                             preview_can_downscale, preview_filter_scale,
                             scale_filter_params)
 from ..core.history import History
-from ..core.layer import LAYER_IMAGE
+from ..core.layer import LAYER_IMAGE, LAYER_SHAPE
 from ..core.paint import _gray
 from ..core.project_io import (PROJECT_EXT, export_flat, imread_rgba,
                                load_project, save_project)
@@ -43,6 +45,7 @@ from ..core.selection import (ADD, INTERSECT, REPLACE, SUBTRACT, Selection)
 from ..core.smart import (content_instances, convert_to_smart, new_filter,
                           new_smart_instance, prune_contents,
                           rasterize_smart, refresh_sizes, sync_smart)
+from ..core.shape import sync_shape_image
 from ..core.text import sync_text_image
 from .canvas_view import CanvasView
 from .content_aware_dialog import ContentAwareDialog
@@ -98,7 +101,11 @@ QSlider::handle:horizontal { background:#8a8a8e; width:12px; margin:-4px 0;
 # ---- 渲染调度（见 §5.21）----
 PROXY_BUDGET_MS = 70.0     # 全量渲染超过这个毫秒数，交互期就改走代理
 PROXY_TARGET_MS = 25.0     # 代理渲染想压到的耗时
-PROXY_MIN_SCALE = 0.15     # 代理最小缩放（再小就糊得看不出在拖什么了）
+# 代理最小缩放（再小就糊得看不出在拖什么了）。
+# 第二十五批 0.15 -> 0.25：1/6.7 分辨率再放大贴回来、还走最近邻，糊得没法看。
+# 实测 12 MP 交互期出图：0.15 -> 81 ms、0.25 -> 157 ms、0.30 -> 206 ms、
+# 0.40 -> 284 ms。取 0.25：糊的程度减掉一大半，代价 +76 ms，还在能跟手的范围内。
+PROXY_MIN_SCALE = 0.25
 PROXY_IDLE_MS = 350        # 交互停手多久之后补一张全分辨率
 PARTIAL_AREA_MAX = 0.6     # 脏区超过画布这个比例，直接整幅重算更划算
 TILE_MIN_AREA = 6_000_000  # 画布超过 6 MP 才分块：小画布省下的内存抵不上瓦片开销
@@ -115,6 +122,39 @@ IMG_FILTER = ("图片文件 (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff 
               "*.heic *.heif *.svg);;所有文件 (*.*)")
 PROJ_FILTER = "Compositor 工程 (*%s);;所有文件 (*.*)" % PROJECT_EXT
 PSD_FILTER = "Photoshop 文档 (*%s);;所有文件 (*.*)" % PSD_EXT
+
+
+class DocSession:
+    """一个标签页 = 一份文档 + 它自己的撤销栈 + 它自己的视图状态。
+
+    主窗口上的 `self.doc` / `self.history` / `self.selected_id` 永远指向
+    **当前标签**那一份，切标签时整份换掉（见 `MainWindow._switch_to`）。
+    这样画布、面板、菜单那一大套代码都不用知道多标签页的存在 —— 它们
+    读到的还是"当前文档"。
+
+    **渲染缓存不跨标签保留**：`_last_arr` 那套是主窗口级的，换文档作废
+    重渲（缓存一张 12 MP 的图是 48 MB，几个标签就吃不住了）。
+
+    `saved_index` 用来判断"有没有未保存的改动"：记的是上次存盘 / 载入时
+    撤销栈停在哪一步，和当前 `history.index` 不等就是改过没存。比"有没有
+    调用过 save"更准 —— 存完盘再撤销回去，它又变回"改过没存"了。
+    """
+
+    def __init__(self, doc, history=None):
+        self.doc = doc
+        self.history = history if history is not None else History()
+        self.selected_id = None
+        self.zoom = 1.0
+        self.scroll = (0, 0)        # (水平, 垂直) 滚动条位置
+        self.saved_index = self.history.index
+
+    @property
+    def dirty(self):
+        """有改动还没存盘吗？"""
+        return self.history.index != self.saved_index
+
+    def mark_saved(self):
+        self.saved_index = self.history.index
 
 
 class NewDocDialog(QDialog):
@@ -139,12 +179,20 @@ class NewDocDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    # 智能对象编辑窗口覆写成 False：它是单文档窗口，不显示标签栏，
+    # 关闭时也不逐个问"要不要保存"（内容本来就是关窗即存）
+    _tabbed = True
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Compositor for Windows")
         self.resize(1400, 900)
         self.setStyleSheet(STYLE)
 
+        # 多标签页：每个标签一份 DocSession，_tab_index 是当前那一份的下标
+        self.sessions = []
+        self._tab_index = -1
+        self._tab_switching = False     # 切标签期间抑制 currentChanged 递归
         self.doc = None
         self.history = History()
         self.selected_id = None
@@ -176,9 +224,43 @@ class MainWindow(QMainWindow):
         self._commit_timer.setInterval(500)
         self._commit_timer.timeout.connect(self._delayed_commit)
         self._commit_label = ""
+        # 通道面板缩略图：不在渲染路径上算（见 _show_channels_panel）
+        self._ch_pending = None
+        self._ch_timer = QTimer(self)
+        self._ch_timer.setSingleShot(True)
+        self._ch_timer.timeout.connect(self._flush_channels_panel)
 
         self.view = CanvasView(self)
-        self.setCentralWidget(self.view)
+        # 标签栏 + 画布：容器里上下排。画布本身还是那个 CanvasView，
+        # 别的代码一律通过 self.view 访问，不受影响。
+        self.tabbar = QTabBar()
+        self.tabbar.setTabsClosable(True)
+        self.tabbar.setMovable(True)
+        self.tabbar.setExpanding(False)
+        self.tabbar.setDrawBase(False)
+        self.tabbar.setStyleSheet(
+            "QTabBar { background:#323235; }"
+            "QTabBar::tab { background:#323235; color:#9a9a9e; padding:4px 12px;"
+            " border:1px solid #3a3a3d; border-bottom:none; margin-right:1px; }"
+            "QTabBar::tab:selected { background:#2b2b2e; color:#fff; }"
+            "QTabBar::tab:hover { color:#ddd; }")
+        if self._tabbed:
+            self.tabbar.currentChanged.connect(self._on_tab_changed)
+            self.tabbar.tabCloseRequested.connect(self.close_tab)
+            self.tabbar.tabMoved.connect(self._on_tab_moved)
+            self.tabbar.setContextMenuPolicy(
+                Qt.ContextMenuPolicy.CustomContextMenu)
+            self.tabbar.customContextMenuRequested.connect(self._tab_menu)
+            self.tabbar.installEventFilter(self)   # 双击空白处 = 新建文档
+        else:
+            self.tabbar.hide()
+        host = QWidget()
+        vbox = QVBoxLayout(host)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+        vbox.addWidget(self.tabbar)
+        vbox.addWidget(self.view, 1)
+        self.setCentralWidget(host)
 
         self.panel = LayersPanel(self)
         dock = QDockWidget("图层", self)
@@ -217,6 +299,9 @@ class MainWindow(QMainWindow):
         dock3.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, dock3)
         self.channels_dock = dock3
+        # 面板藏起来时不算缩略图（见 _show_channels_panel），露出来时补一次
+        dock3.visibilityChanged.connect(
+            lambda on: self._flush_channels_panel() if on else None)
 
         self.zoom_label = QLabel("100%")
         self.status = self.statusBar()
@@ -364,6 +449,19 @@ class MainWindow(QMainWindow):
             "按内容裁剪", "", self.trim_to_content,
             "把四周全空的区域裁掉"))
 
+        m_win = self.menuBar().addMenu("窗口")
+        m_win.addAction(self._act("下一个文档", "Ctrl+Tab",
+                                  lambda: self.cycle_tab(1)))
+        m_win.addAction(self._act("上一个文档", "Ctrl+Shift+Tab",
+                                  lambda: self.cycle_tab(-1)))
+        m_win.addSeparator()
+        m_win.addAction(self._act("文档列表…", "", self.ask_switch_document,
+                                  "标签多了之后从这里挑"))
+        m_win.addSeparator()
+        m_win.addAction(self._act("关闭当前文档", "Ctrl+W",
+                                  lambda: self.close_tab(self._tab_index),
+                                  "关掉这一个标签（有未保存改动会先问）"))
+
         m_view = self.menuBar().addMenu("视图")
         m_view.addAction(self._act("适应窗口", "Ctrl+0", self.view.fit))
         m_view.addAction(self._act("实际像素", "Ctrl+1", self.view.zoom_actual))
@@ -506,8 +604,9 @@ class MainWindow(QMainWindow):
         bg[..., 3] = 255
         layer = make_image_layer("背景", bg, w, h)
         doc.layers.append(layer)
-        self.set_document(doc, reset_history=True)
+        self._open_in_tab(doc)          # 新建 = 新开一个标签，不顶掉当前的
         self.view.fit()
+        self._capture_session()         # fit 改了缩放，回写进这个标签的状态
 
     def ask_new_document(self):
         dlg = NewDocDialog(self, self.doc.width if self.doc else 1600,
@@ -516,18 +615,36 @@ class MainWindow(QMainWindow):
             self.new_document(dlg.w.value(), dlg.h.value())
 
     def set_document(self, doc, reset_history=False):
+        """把**当前标签**换成这份文档（不新开标签）。
+
+        只有"编辑器窗口载入内容"这类场景用它；新建 / 打开 / 导入 PSD 走
+        `_open_in_tab()` —— 那才是"再来一个标签"。
+        """
+        s = self._cur()
+        if s is None:                   # 还没有标签（初始化 / 单文档窗口）
+            s = DocSession(doc)
+            self.sessions.append(s)
+            self._tab_index = len(self.sessions) - 1
+            if self._tabbed:
+                self.tabbar.addTab(self._tab_text(s))
+        s.doc = doc
+        if reset_history:
+            s.history.reset(doc)
+            s.saved_index = s.history.index
         self.doc = doc
+        self.history = s.history
         self.selected_id = None
+        s.selected_id = None
         self._last_arr = None           # 换了文档，渲染缓存作废
         self._arr_valid = False
         self._dirty = None
         self._render_ms = 0.0
-        if reset_history:
-            self.history.reset(doc)
         self.panel.rebuild()
         self.inspector.refresh()
+        self.channels.rebuild()
         self.request_render()
         self.view.update_selection_overlay()
+        self._sync_quick_mask_ui()
         self._update_title()
 
     def _update_title(self):
@@ -536,6 +653,228 @@ class MainWindow(QMainWindow):
         tag = "  [快速蒙版]" if quick_mask.is_on(self.doc) else ""
         self.setWindowTitle("Compositor for Windows — %s  [%s]%s"
                             % (name, path, tag))
+        if self._tabbed:
+            i = self._tab_index
+            if 0 <= i < self.tabbar.count():
+                self.tabbar.setTabText(i, self._tab_text(self._cur()))
+
+    # ---------- 多标签页（第二十四批） ----------
+
+    def _cur(self):
+        """当前标签的会话；还没有标签时返回 None。"""
+        if 0 <= self._tab_index < len(self.sessions):
+            return self.sessions[self._tab_index]
+        return None
+
+    @staticmethod
+    def _tab_text(s):
+        """标签上写什么：文档名，改过没存的加个 *。"""
+        if s is None or s.doc is None:
+            return "—"
+        return (s.doc.name or "未命名") + (" *" if s.dirty else "")
+
+    def _capture_session(self):
+        """把主窗口上的状态写回当前标签的会话（切标签 / 关标签前调用）。
+
+        撤销栈是**按引用**共享的：`self.history` 一直是同一个对象，所以
+        这里存引用就够。文档不一样 —— `undo()` 会把 `self.doc` 整个换成
+        栈里的另一份，所以每次都得重新读一遍。
+        """
+        s = self._cur()
+        if s is None:
+            return
+        s.doc = self.doc
+        s.history = self.history
+        s.selected_id = self.selected_id
+        s.zoom = self.view.zoom
+        s.scroll = (self.view.horizontalScrollBar().value(),
+                    self.view.verticalScrollBar().value())
+
+    def _apply_session(self, s):
+        """把会话里的状态装回主窗口。"""
+        self.doc = s.doc
+        self.history = s.history
+        self.selected_id = s.selected_id
+        # 渲染缓存是主窗口级的，换文档一律作废重渲
+        self._last_arr = None
+        self._arr_valid = False
+        self._dirty = None
+        self._render_ms = 0.0
+        self._adj_layer = None
+        self._adj_snap = None
+        self._filter_ctx = None
+        clear_proxy_cache()
+        self.panel.rebuild()
+        self.inspector.refresh()
+        self.channels.rebuild()
+        self.view.update_selection_overlay()
+        self._sync_quick_mask_ui()
+        self.request_render()
+        self._update_title()
+        # 视图状态最后恢复：先定缩放，滚动条范围才对得上
+        self.view.set_zoom(s.zoom)
+        self.view.horizontalScrollBar().setValue(s.scroll[0])
+        self.view.verticalScrollBar().setValue(s.scroll[1])
+        self.view._update_handles()
+
+    def _switch_to(self, i):
+        """切到第 i 个标签。"""
+        if i == self._tab_index or not (0 <= i < len(self.sessions)):
+            return
+        self._tab_switching = True
+        try:
+            # 浮动选区与画布上的文字输入框都挂在旧文档上，切走前先收尾
+            self.stamp_float(silent=True)
+            self.view.end_text_edit()
+            self.set_interactive(False)
+            self._capture_session()
+            self._tab_index = i
+            self._apply_session(self.sessions[i])
+        finally:
+            self._tab_switching = False
+        if self.tabbar.currentIndex() != i:
+            self.tabbar.blockSignals(True)
+            self.tabbar.setCurrentIndex(i)
+            self.tabbar.blockSignals(False)
+
+    def _on_tab_changed(self, i):
+        if self._tab_switching:
+            return
+        self._switch_to(i)
+
+    def _on_tab_moved(self, frm, to):
+        s = self.sessions.pop(frm)
+        self.sessions.insert(to, s)
+        self._tab_index = self.tabbar.currentIndex()
+
+    def _open_in_tab(self, doc, history=None):
+        """新开一个标签装这份文档，并切过去。"""
+        s = DocSession(doc, history)
+        if history is None:
+            s.history.reset(doc)
+            s.saved_index = s.history.index
+        self.sessions.append(s)
+        if self._tabbed:
+            self.tabbar.addTab(self._tab_text(s))
+            self._switch_to(len(self.sessions) - 1)
+        else:
+            self._tab_index = len(self.sessions) - 1
+            self._apply_session(s)
+        return s
+
+    def cycle_tab(self, delta):
+        """Ctrl+Tab / Ctrl+Shift+Tab：在标签之间绕一圈。"""
+        n = len(self.sessions)
+        if n < 2:
+            return
+        self._switch_to((self._tab_index + delta) % n)
+
+    def _tab_menu(self, pos):
+        """标签上右键：关闭 / 关闭其他（空白处右键则是新建）。"""
+        i = self.tabbar.tabAt(pos)
+        menu = QMenu(self)
+        a_close = menu.addAction("关闭")
+        a_others = menu.addAction("关闭其他")
+        menu.addSeparator()
+        menu.addAction("新建文档")
+        a_close.setEnabled(i >= 0)
+        a_others.setEnabled(i >= 0 and len(self.sessions) > 1)
+        act = menu.exec(self.tabbar.mapToGlobal(pos))
+        if act is None:
+            return
+        text = act.text()
+        if text == "关闭" and i >= 0:
+            self.close_tab(i)
+        elif text == "关闭其他" and i >= 0:
+            # 从后往前关，索引才不会错位；用户点了取消就停下
+            for j in range(len(self.sessions) - 1, -1, -1):
+                if j != i and not self.close_tab(j):
+                    break
+        elif text == "新建文档":
+            self.ask_new_document()
+
+    def eventFilter(self, obj, ev):
+        # 标签栏空白处双击 = 新建文档（Photoshop 的快捷键习惯）
+        if obj is self.tabbar and ev.type() == QEvent.Type.MouseButtonDblClick:
+            if ev.button() == Qt.MouseButton.LeftButton:
+                p = ev.position().toPoint() if hasattr(ev, "position") else ev.pos()
+                if self.tabbar.tabAt(p) < 0:
+                    self.ask_new_document()
+                    return True
+        return super().eventFilter(obj, ev)
+
+    def ask_switch_document(self):
+        """「窗口 > 文档列表…」：标签多了之后从列表里挑。"""
+        if not self.sessions:
+            return
+        names = [self._tab_text(s) for s in self.sessions]
+        name, ok = QInputDialog.getItem(
+            self, "切换文档", "文档：", names, max(0, self._tab_index), False)
+        if ok and name in names:
+            self._switch_to(names.index(name))
+
+    def close_tab(self, i, force=False):
+        """关掉第 i 个标签。force=True 时不问"要不要保存"直接关。"""
+        if not self._tabbed or not (0 <= i < len(self.sessions)):
+            return False
+        if len(self.sessions) <= 1:
+            self.status.showMessage("只有一个文档 —— 要关就关窗口", 3000)
+            return False
+        s = self.sessions[i]
+        if s.dirty and not force:
+            if not self._ask_save_before_close(i, s):
+                return False
+        self.tabbar.blockSignals(True)
+        self.tabbar.removeTab(i)
+        self.tabbar.blockSignals(False)
+        del self.sessions[i]
+        if self._tab_index > i:
+            self._tab_index -= 1
+        elif self._tab_index == i:
+            # 关的是当前标签：切到后一个（最后一个就取前一个）
+            j = min(i, len(self.sessions) - 1)
+            self._tab_index = -1
+            self._switch_to(j)
+        self.status.showMessage("已关闭「%s」" % (s.doc.name if s.doc else "—"),
+                                2500)
+        return True
+
+    def _ask_save_before_close(self, i, s):
+        """改动没存 —— 保存 / 不保存 / 取消。返回 False 表示取消关闭。"""
+        self._switch_to(i)              # 让用户看着那份文档做决定
+        name = s.doc.name if s.doc is not None else "—"
+        box = QMessageBox(self)
+        box.setWindowTitle("未保存的改动")
+        box.setText("「%s」有未保存的改动，要保存吗？" % name)
+        box.setIcon(QMessageBox.Icon.Warning)
+        b_save = box.addButton("保存", QMessageBox.ButtonRole.AcceptRole)
+        b_drop = box.addButton("不保存", QMessageBox.ButtonRole.DestructiveRole)
+        b_cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(b_save)
+        box.exec()
+        if box.clickedButton() is b_cancel:
+            return False
+        if box.clickedButton() is b_save:
+            self.save_project()
+            # 用户在"另存为"里点了取消 -> 当作取消关闭，别把改动丢了
+            if self._cur() is not None and self._cur().dirty:
+                return False
+        return True
+
+    def closeEvent(self, event):
+        """关窗口：逐个确认未保存的文档，再关掉开着的智能对象编辑窗口。"""
+        if self._tabbed:
+            for i in range(len(self.sessions) - 1, -1, -1):
+                if self.sessions[i].dirty:
+                    if not self._ask_save_before_close(i, self.sessions[i]):
+                        event.ignore()
+                        return
+        for ed in list(getattr(self, "_so_editors", [])):
+            try:
+                ed.close()
+            except Exception:
+                pass
+        super().closeEvent(event)
 
     # ---------- 选择 ----------
 
@@ -618,6 +957,86 @@ class MainWindow(QMainWindow):
         if len(cur) > DIRTY_MAX_RECTS:
             cur = [_union(cur)]
         self._dirty = cur[0] if len(cur) == 1 else cur
+
+    # ---- 结构性改动的脏区（第二十五批，方案 E 第 1 条）----
+
+    def layer_dirty_rect(self, *layers):
+        """改了这几个图层 —— 该重算画布的哪一块。
+
+        以前这类改动一律 `mark_dirty(None)` → **整幅重算**（12 MP 实测
+        1.9~2.5 s，小画布 230 ms），可往往只动了一个图层，真正会变的只有它
+        盖住的那一块。这一条是「点按钮有延迟」里最大的一块。
+
+        返回 None = 必须整幅（保守，但永远是对的）；返回 (x0, y0, x1, y1) =
+        只重算那一块。`_want_full()` 还会再判一次：脏区超过画布 60% 或有
+        Dissolve，照样退回整幅。
+
+        判定成整幅的情况（宁可保守）：
+        - 涉及到调整层（它作用于下方全部内容，没有"局部"可言）
+        - **这几个图层上方还有调整层**（它们的输入变了，输出跟着变）
+        - 算不出包围盒（空组、图层全在画布外）
+        """
+        doc = self.doc
+        if doc is None:
+            return None
+        seen = []
+        affected = []
+        for l in layers:
+            if l is None or l.id in seen:
+                continue
+            seen.append(l.id)
+            affected.append(l)
+            # 剪贴在它上面的那些也跟着变（基底一改，剪贴层的显示就变了）
+            _, lst, idx = doc.find_with_parent(l.id)
+            if lst is not None:
+                j = idx + 1
+                while j < len(lst) and lst[j].clipped:
+                    if lst[j].id not in seen:
+                        seen.append(lst[j].id)
+                        affected.append(lst[j])
+                    j += 1
+        if not affected or any(l.is_adjustment for l in affected):
+            return None
+        # 上方还有调整层吗？有 -> 它的输入变了，只能整幅
+        flat = list(doc.all_layers())
+        pos = dict((id(l), i) for i, l in enumerate(flat))
+        top = max((pos.get(id(l), -1) for l in affected), default=-1)
+        for i, l in enumerate(flat):
+            if l.is_adjustment and i > top:
+                return None
+        # 收集包围盒：组 = 所有子孙的并集（不看 visible —— 保守）
+        boxes = []
+
+        def collect(l):
+            if l.is_group:
+                for c in l.children:
+                    collect(c)
+                return
+            b = l.bbox(doc.width, doc.height)
+            if b is not None:
+                boxes.append(b)
+
+        for l in affected:
+            collect(l)
+        if not boxes:
+            return None
+        pad = max_effect_padding(doc)      # 图层样式的外扩（模糊/投影要上下文）
+        x0 = max(0, math.floor(min(b[0] for b in boxes) - pad))
+        y0 = max(0, math.floor(min(b[1] for b in boxes) - pad))
+        x1 = min(doc.width, math.ceil(max(b[2] for b in boxes) + pad))
+        y1 = min(doc.height, math.ceil(max(b[3] for b in boxes) + pad))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return (x0, y0, x1, y1)
+
+    def reorder_dirty_rect(self, layer, lst, old_idx, new_idx):
+        """图层换了位置：被挪的那个 + 它跨过的那些，全都要重算。"""
+        lo, hi = min(old_idx, new_idx), max(old_idx, new_idx)
+        group = [layer]
+        for j in range(lo, hi + 1):
+            if 0 <= j < len(lst) and lst[j] is not layer:
+                group.append(lst[j])
+        return self.layer_dirty_rect(*group)
 
     def _dirty_rects(self):
         """当前的脏区，统一成"矩形列表"。空表示什么都不用重算。"""
@@ -857,9 +1276,12 @@ class MainWindow(QMainWindow):
 
     def commit(self, label=""):
         self.history.commit(self.doc)
+        if (s := self._cur()) is not None:
+            s.doc = self.doc
         # 落撤销点 = 一次改动的结束：源图可能被就地改过，代理的降采样缓存作废。
         # 拖拽过程中不会 commit，所以缓存能一直热到松手。
         clear_proxy_cache()
+        self._update_title()            # 标签上的 *（改过没存）跟着变
         if label:
             self.status.showMessage(label, 3000)
 
@@ -878,12 +1300,16 @@ class MainWindow(QMainWindow):
         keep = self.selected_id
         self.doc = d
         self.selected_id = keep
+        if (s := self._cur()) is not None:
+            s.doc = d                   # 撤销栈换了一整棵图层树，会话要跟着换
+            s.selected_id = keep
         self._last_arr = None           # 整棵图层树被换掉了，缓存作废
         self._arr_valid = False
         self.panel.rebuild()
         self.inspector.refresh()
         self.request_render()
         self.view.update_selection_overlay()
+        self._update_title()
         self.status.showMessage("撤销", 2000)
 
     def redo(self):
@@ -893,12 +1319,16 @@ class MainWindow(QMainWindow):
         keep = self.selected_id
         self.doc = d
         self.selected_id = keep
+        if (s := self._cur()) is not None:
+            s.doc = d
+            s.selected_id = keep
         self._last_arr = None
         self._arr_valid = False
         self.panel.rebuild()
         self.inspector.refresh()
         self.request_render()
         self.view.update_selection_overlay()
+        self._update_title()
         self.status.showMessage("重做", 2000)
 
     # ---------- 文件操作 ----------
@@ -912,8 +1342,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "打开失败", str(e))
             return
-        self.set_document(doc, reset_history=True)
+        self._open_in_tab(doc)          # 打开 = 新开一个标签
         self.view.fit()
+        self._capture_session()
 
     def save_project(self):
         if self.doc is None:
@@ -926,6 +1357,8 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "保存失败", str(e))
             return
+        if (s := self._cur()) is not None:
+            s.mark_saved()
         self._update_title()
         self.status.showMessage("已保存 %s" % self.doc.path, 3000)
 
@@ -946,6 +1379,8 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "保存失败", str(e))
             return
+        if (s := self._cur()) is not None:
+            s.mark_saved()
         self._update_title()
         self.status.showMessage("已保存 %s" % path, 3000)
 
@@ -990,7 +1425,7 @@ class MainWindow(QMainWindow):
             self.selected_id = layer.id
         self.commit("导入图层")
         self.panel.rebuild()
-        self.request_render()
+        self.request_render(self.layer_dirty_rect(layer))
 
     def import_psd(self):
         """导入一个 Photoshop 文档，整棵图层树搬进来。"""
@@ -1011,8 +1446,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "导入失败", "%s\n%s" % (path, e))
             return
-        self.set_document(doc, reset_history=True)
+        self._open_in_tab(doc)          # 导入 PSD = 新开一个标签
         self.view.fit()
+        self._capture_session()
         bits = ["已导入 %s —— %d 个顶层图层"
                 % (os.path.basename(path), len(doc.layers))]
         if STATS["text"]:
@@ -1024,6 +1460,116 @@ class MainWindow(QMainWindow):
             bits.append("%d 个图层带上图层样式" % STATS["effects"])
         bits.append("智能对象 / 调整层仍为合并位图")
         self.status.showMessage("；".join(bits), 8000)
+
+    # ---------- 矢量形状（第二十六批）----------
+
+    def create_shape_layer(self, box, params=None, name="形状"):
+        """建一个矢量形状图层。`box` 是画布坐标 (x0, y0, x1, y1)。
+
+        像素是**按当前尺寸现画**的（见 core.shape），所以之后拖动放大、
+        改颜色 / 圆角 / 边数都只是重画一次，不会越改越糊。
+        """
+        doc = self.doc
+        if doc is None:
+            return None
+        p = params or self.opts.shape_layer_params(box)
+        center = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+        layer = make_shape_layer(name, doc.width, doc.height, params=p,
+                                 center=center)
+        if self.selected_id and self.doc.find(self.selected_id) is not None:
+            self.doc.insert_above(self.selected_id, layer)
+        else:
+            self.doc.layers.append(layer)
+        self.selected_id = layer.id
+        self.commit("新建形状图层")
+        self.panel.rebuild()
+        self.inspector.refresh()
+        self.request_render(self.layer_dirty_rect(layer))
+        self.status.showMessage(
+            "形状图层已创建 —— 右侧「属性」面板里改颜色 / 圆角 / 边数，"
+            "拖动放大也不会糊", 6000)
+        return layer
+
+    def draw_vector_shape(self, p0, p1, params=None, modifiers=None):
+        """形状工具的「矢量图层」模式：拖出一个形状图层（不是往像素上涂）。"""
+        if self.doc is None:
+            return False
+        x0, y0 = float(p0[0]), float(p0[1])
+        x1, y1 = float(p1[0]), float(p1[1])
+        shift = bool(modifiers and modifiers & Qt.ShiftModifier)
+        kind = self.opts.shape_kind
+        if shift:
+            if kind == "直线":
+                # 45° 吸附：取绝对值大的那个轴当主轴
+                if abs(x1 - x0) >= abs(y1 - y0):
+                    y1 = y0
+                else:
+                    x1 = x0
+            else:
+                s = max(abs(x1 - x0), abs(y1 - y0))
+                x1 = x0 + (s if x1 >= x0 else -s)
+                y1 = y0 + (s if y1 >= y0 else -s)
+        bx0, bx1 = min(x0, x1), max(x0, x1)
+        by0, by1 = min(y0, y1), max(y0, y1)
+        if (bx1 - bx0) < 2 or (by1 - by0) < 2:
+            self.status.showMessage("形状太小了")
+            return False
+        box = [bx0, by0, bx1, by1]
+        p = params or self.opts.shape_layer_params(box)
+        if p.get("kind") == "line":
+            # 直线的几何是**有向**的两个端点：存相对框左上角的位置，
+            # 这样从下往上 / 从右往左拖也不会把方向翻过来
+            p["points"] = [[x0 - bx0, y0 - by0], [x1 - bx0, y1 - by1]]
+        return self.create_shape_layer(
+            box, p, name=self.opts.shape_kind) is not None
+
+    def set_shape_param(self, key, value):
+        """改形状图层的一个参数并重新栅格化（非破坏性：参数还在）。"""
+        layer = self.selected_layer()
+        if layer is None or not layer.is_shape or layer.shape is None:
+            return False
+        if layer.shape.get(key) == value:
+            return False
+        layer.shape[key] = value
+        sync_shape_image(layer)
+        self.panel.rebuild()
+        # 改的是几何（圆角 / 边数 / 描边宽度都可能改变外形大小），
+        # 影响范围不好界定 —— 跟文字层一样走整幅
+        self.request_render()
+        self.schedule_commit("形状参数")
+        return True
+
+    def set_shape_style(self, which, key, value):
+        """改填充 / 描边里的一个字段（这两个是嵌套 dict，不能走 set_shape_param）。"""
+        layer = self.selected_layer()
+        if layer is None or not layer.is_shape or layer.shape is None:
+            return False
+        st = dict(layer.shape.get(which) or {})
+        if st.get(key) == value:
+            return False
+        st[key] = value
+        layer.shape[which] = st
+        sync_shape_image(layer)
+        self.panel.rebuild()
+        self.request_render()
+        self.schedule_commit("形状参数")
+        return True
+
+    def rasterize_shape(self):
+        """形状图层 -> 普通位图图层。栅格化之后才能用画笔 / 滤镜改像素。"""
+        layer = self.selected_layer()
+        if layer is None or not layer.is_shape:
+            return False
+        layer.kind = LAYER_IMAGE
+        layer.shape = None
+        self.commit("栅格化形状")
+        self.panel.rebuild()
+        self.inspector.refresh()
+        self.request_render(self.layer_dirty_rect(layer))
+        self.status.showMessage(
+            "已栅格化成普通位图图层 —— 现在可以用画笔和滤镜了（形状不能再改）",
+            5000)
+        return True
 
     # ---------- 文字 ----------
 
@@ -1052,7 +1598,7 @@ class MainWindow(QMainWindow):
         self.commit("新建文字图层")
         self.panel.rebuild()
         self.inspector.refresh()
-        self.request_render()
+        self.request_render(self.layer_dirty_rect(layer))
         self.status.showMessage(
             "文字已创建 —— 在右侧「属性」面板里改字 / 字体 / 字号，随时可改", 5000)
         return layer
@@ -1104,6 +1650,8 @@ class MainWindow(QMainWindow):
             self.rasterize_text()
         elif layer.is_smart:
             self.rasterize_smart()
+        elif layer.is_shape:
+            self.rasterize_shape()
         else:
             self.status.showMessage("这个图层本来就是普通位图图层", 2500)
 
@@ -1117,7 +1665,7 @@ class MainWindow(QMainWindow):
         self.commit("栅格化文字")
         self.panel.rebuild()
         self.inspector.refresh()
-        self.request_render()
+        self.request_render(self.layer_dirty_rect(layer))
         self.status.showMessage(
             "已栅格化成普通位图图层 —— 现在可以用画笔和滤镜了（文字不能再改）", 5000)
 
@@ -1361,7 +1909,7 @@ class MainWindow(QMainWindow):
             return False
         layer.effects = paste_style()
         self.commit("粘贴图层样式")
-        self.request_render()
+        self.request_render(self.layer_dirty_rect(layer))
         self.inspector.refresh()
         self.panel.rebuild()
         self.status.showMessage("已粘贴图层样式", 4000)
@@ -1388,9 +1936,10 @@ class MainWindow(QMainWindow):
         """像素是"算出来"的图层不能直接改像素 —— 先挡住。
 
         文字图层的像素由参数生成，智能对象的像素由嵌入内容渲染而来，
-        它们都会在下次重算时被冲掉，所以要改就得走各自的门：
+        形状图层的像素由路径画出来 —— 它们都会在下次重算时被冲掉，
+        所以要改就得走各自的门：
         文字 -> 属性面板改参数；智能对象 -> 「编辑内容」/「智能滤镜」；
-        真想直接画 -> 先栅格化。
+        形状 -> 属性面板改颜色 / 圆角 / 边数；真想直接画 -> 先栅格化。
         """
         layer = self.selected_layer()
         if layer is None:
@@ -1399,6 +1948,12 @@ class MainWindow(QMainWindow):
             self.status.showMessage(
                 "文字图层不能直接%s —— 想改像素请先在属性面板里「栅格化」" % what,
                 5000)
+            return True
+        if layer.is_shape:
+            self.status.showMessage(
+                "形状图层的像素是路径画出来的，不能直接%s —— "
+                "改形状用右侧「属性」面板（颜色 / 圆角 / 边数 / 描边），"
+                "想随笔画就先「栅格化」" % what, 6000)
             return True
         if layer.is_smart:
             self.status.showMessage(
@@ -1425,7 +1980,7 @@ class MainWindow(QMainWindow):
         self.selected_id = clone.id
         self.commit("复制图层")
         self.panel.rebuild()
-        self.request_render()
+        self.request_render(self.layer_dirty_rect(clone))
 
     def delete_layer(self):
         layer = self.selected_layer()
@@ -1433,15 +1988,15 @@ class MainWindow(QMainWindow):
             return
         self.stamp_float(silent=True)
         if len(self.doc.layers) == 1 and not layer.is_group:
-            QMessageBox.information(self, "提示", "至少要保留一个图层。")
             return
+        dead = self.layer_dirty_rect(layer)
         self.doc.remove(layer.id)
         self.selected_id = None
         prune_contents(self.doc)    # 智能对象删掉之后，没人引用的内容要回收
         self.commit("删除图层")
         self.panel.rebuild()
         self.inspector.refresh()
-        self.request_render()
+        self.request_render(dead)
 
     def group_selection(self):
         layer = self.selected_layer()
@@ -1456,7 +2011,7 @@ class MainWindow(QMainWindow):
         self.selected_id = g.id
         self.commit("新建图层组")
         self.panel.rebuild()
-        self.request_render()
+        self.request_render(self.layer_dirty_rect(g))
 
     # ---------- 调整层 ----------
 
@@ -1493,7 +2048,7 @@ class MainWindow(QMainWindow):
                 "已标记裁剪，但它下面需要紧跟一个调整层才会生效", 4000)
         self.commit("剪贴蒙版")
         self.panel.rebuild()
-        self.request_render()
+        self.request_render(self.layer_dirty_rect(layer))
 
     # ---------- 滤镜 ----------
 
@@ -1674,9 +2229,27 @@ class MainWindow(QMainWindow):
 
         传原始 arr（不是 `_show()` 处理过的）：PS 的通道缩略图始终显示
         通道的**真实内容**，不受"这一路当前可不可见"影响。
+
+        **不再卡在渲染路径上**（第二十五批，方案 E 第 2 条）：实测 86 ms/次，
+        原来不管面板藏没藏都算，小画布上一次点击有三分之一花在这。现在只把
+        结果记下来，真正的缩略图挪到下一轮事件循环（`_ch_timer`）去算 ——
+        点按钮的人先看到画面，通道缩略图晚一帧出现没关系。
+        面板没露出来时干脆不算，等它露出来（`visibilityChanged`）再补。
         """
-        if hasattr(self, "channels"):
-            self.channels.set_render(arr)
+        if not hasattr(self, "channels"):
+            return
+        self._ch_pending = arr
+        if not self.channels.isVisible():
+            return
+        self._ch_timer.start()
+
+    def _flush_channels_panel(self):
+        """把攒着的渲染结果补进给通道面板（面板刚露出来时调用）。"""
+        arr = getattr(self, "_ch_pending", None)
+        if arr is None or not hasattr(self, "channels"):
+            return
+        self._ch_pending = None
+        self.channels.set_render(arr)
 
     def load_channel_selection(self, cid):
         """把通道内容作为选区载入画布。"""
@@ -2285,7 +2858,13 @@ class MainWindow(QMainWindow):
         """形状工具：在 p0→p1 之间落一个矩形 / 椭圆 / 直线。
 
         `modifiers` 里 Shift 表示等比 / 正圆 / 45° 直线（和选区工具一致）。
+
+        工具选项条上的「绘制为」决定落哪儿：
+          * **矢量图层**（默认）—— 新建一个可编辑的形状图层
+          * **像素** —— 涂在当前图层的像素上（第二十批的老行为）
         """
+        if self.opts.shape_mode != "pixel":
+            return self.draw_vector_shape(p0, p1, params, modifiers)
         layer = self._retouch_target_layer("形状")
         if layer is None:
             return False
@@ -2538,7 +3117,7 @@ class MainWindow(QMainWindow):
             layer.mask_enabled = True
             self.commit("从明度建立蒙版")
         self.panel.rebuild()
-        self.request_render()
+        self.request_render(self.layer_dirty_rect(layer))
 
     def toggle_mask(self):
         layer = self.selected_layer()
@@ -2547,7 +3126,7 @@ class MainWindow(QMainWindow):
         layer.mask_enabled = not layer.mask_enabled
         self.commit("切换蒙版")
         self.panel.rebuild()
-        self.request_render()
+        self.request_render(self.layer_dirty_rect(layer))
 
     def delete_mask(self):
         layer = self.selected_layer()
@@ -2556,7 +3135,7 @@ class MainWindow(QMainWindow):
         layer.mask = None
         self.commit("删除蒙版")
         self.panel.rebuild()
-        self.request_render()
+        self.request_render(self.layer_dirty_rect(layer))
 
     # ---------- 画布 ----------
 
@@ -2771,7 +3350,12 @@ class SmartObjectEditor(MainWindow):
     让栅格缓存失效即可。
 
     这个窗口不是模态的：可以同时开着几个智能对象互相对照。
+
+    单文档窗口：不显示标签栏、关闭时不逐个问「要不要保存」（这个窗口本来
+    就是关窗即存），所以把 `_tabbed` 覆写成 False。
     """
+
+    _tabbed = False
 
     def __init__(self, parent, owner, content, doc):
         super().__init__()

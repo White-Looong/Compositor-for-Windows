@@ -790,6 +790,21 @@ def main():
         app.processEvents()
         pm = sdlg.grab()
 
+    elif tool == "tabs":
+        # 第二十四批：多标签页。再造两份文档，其中一份改过没存（标签上带 *）
+        win.new_document(1200, 800, "海报草稿")
+        blk = Layer("色块", "image", _grad(700, 500, (255, 168, 60), (232, 62, 140)))
+        blk.tx, blk.ty = 600.0, 400.0
+        win.doc.layers.append(blk)
+        win.commit("新建色块图层")            # 落一个撤销点 -> 标签上出现 *
+        win.new_document(900, 1200, "竖版排版")
+        win._switch_to(0)                  # 回到「示例工程」
+        win.view.fit()
+        win._do_render()
+        app.processEvents()
+        app.processEvents()
+        pm = win.grab()
+
     else:
         pm = win.grab()
     pm.save(out)

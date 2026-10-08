@@ -7,8 +7,8 @@ import cv2
 
 from .adjust import default_params
 from .blend import PASS_THROUGH
-from .layer import (LAYER_ADJUSTMENT, LAYER_GROUP, LAYER_IMAGE, LAYER_SMART,
-                    LAYER_TEXT, Layer)
+from .layer import (LAYER_ADJUSTMENT, LAYER_GROUP, LAYER_IMAGE, LAYER_SHAPE,
+                    LAYER_SMART, LAYER_TEXT, Layer)
 from .text import default_text_params, render_text
 from . import guides as _guides
 
@@ -309,6 +309,26 @@ def make_adjustment_layer(name="调整", key="levels", canvas_w=0, canvas_h=0):
     l.adjust = {"type": key, "params": default_params(key)}
     l.tx = canvas_w / 2.0
     l.ty = canvas_h / 2.0
+    return l
+
+
+def make_shape_layer(name="形状", canvas_w=0, canvas_h=0, params=None,
+                     center=None):
+    """矢量形状层：像素由路径参数栅格化生成，参数留在 layer.shape 里可以再改。
+
+    center 给 (x, y) 时用它作为图层中心，否则放到画布中心。
+    """
+    from .shape import default_shape_params, render_shape
+    p = default_shape_params(**(params or {}))
+    l = Layer(name, LAYER_SHAPE, image=render_shape(p))
+    l.blend = "Normal"
+    l.shape = p
+    if center is None:
+        l.tx = canvas_w / 2.0
+        l.ty = canvas_h / 2.0
+    else:
+        l.tx = float(center[0])
+        l.ty = float(center[1])
     return l
 
 

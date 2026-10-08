@@ -48,6 +48,10 @@
 
 ![画布大小：九宫格锚点 + 边缘填充](docs/screenshot-canvasdlg.png)
 
+![多标签页：几份文档同时开着，改过没存的标签带 *](docs/screenshot-tabs.png)
+
+![缩放显示：最近邻（上）与平滑（下）的差别](docs/screenshot-smooth.png)
+
 ---
 
 ## 快速开始
@@ -243,6 +247,9 @@ python -m venv .venv
 
 **画布与文件**
 - 新建工程、打开 / 保存 `.cwproj` 工程文件（zip 包，非破坏性）
+- **多标签页**：新建 / 打开 / 导入 PSD 都开一个新标签，几份文档同时开着来回切
+  （`Ctrl+Tab` / `Ctrl+Shift+Tab`，`Ctrl+W` 关当前这个，标签上的 `*` 表示改过没存）。
+  每份文档有自己的撤销栈、选中图层与缩放位置
 - 导入 PNG / JPEG / BMP / WebP / TIFF / **HEIC**（手机照片）/ **SVG**（矢量） 作为图层
 - **SVG 导入**（第二十三批）：自研子集解析器（`core/svg_import.py`），path / 基本形状 / `use` / 渐变 / 裁剪 / 变换 / 文字都出图，尺寸按画布走；`pattern` / `mask` / `filter` 这类语法不还原
 - **导入 PSD**：整棵图层树搬进来，组 / 混合模式 / 不透明度 / 蒙版 / 剪贴 / 可见性都保留；
@@ -325,6 +332,8 @@ python -m venv .venv
 
 **图像**：`Ctrl+Alt+C` 画布大小
 
+**窗口**：`Ctrl+Tab` 下一个文档 · `Ctrl+Shift+Tab` 上一个文档 · `Ctrl+W` 关闭当前文档
+
 **命令**：`Ctrl+N` 新建 · `Ctrl+O` 打开 · `Ctrl+S` 保存 · `Ctrl+Shift+S` 另存为 ·
 `Ctrl+I` 导入图片（PNG / JPEG / BMP / WebP / TIFF / HEIC / SVG） · `Ctrl+Shift+O` 导入 PSD · `Ctrl+Shift+E` 导出 PNG ·
 `Ctrl+Z` 撤销 · `Ctrl+Shift+Z` 重做 · `Ctrl+G` 建组 · `Ctrl+J` 复制图层 ·
@@ -367,7 +376,7 @@ src/
     svg_import.py  SVG 子集解析 + 栅格化（第二十三批）
     project_io.py  .cwproj 读写、图片导入导出
   ui/
-    main_window.py 主窗口、工具、菜单与所有文档操作
+    main_window.py 主窗口、工具、菜单、文档操作与多标签页（每个标签一份 DocSession）
     canvas_view.py 画布视图、变换手柄、选区交互、描边、蒙版红罩、画布内文字编辑
     layers_panel.py 图层面板
     channels_panel.py 通道面板
@@ -461,6 +470,9 @@ channels/<id>.png   每个附加 Alpha 通道的灰度遮罩（单通道）
   （保持黑白两端不动、只推中间调），数值不完全等于 Photoshop
 - 可选颜色的 C/M/Y/K 是「相对量」算法，数值与 Photoshop 不严格一致
 - 调整层的剪贴蒙版只支持「紧跟基底图层」这一种形式，不能多层嵌套成裁剪组
+- **拖手 / 拖滑块时的预览是代理图**：为了让拖动跟手，交互期会按 1/4（大画布上）
+  分辨率先出一张，松手后自动补全分辨率 —— 所以拖动过程中看着糊是正常的。
+  12 MP 画布上拖调整层滑块仍是代理（调整层作用于下方全部内容，单帧全分辨率要 ~1.9 s）
 - 文字**没有自动换行 / 文本框**：只有硬换行，所以「两端对齐」是撑到最长那一行的宽度；
   段前 / 段后距只作用于段落之间（首段之前、末段之后不留）
 - 逐字调整按**字符下标**记，所以在文字中间插字之后，后面的调整会整体错位（要重调）

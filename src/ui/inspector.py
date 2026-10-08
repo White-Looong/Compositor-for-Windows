@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QHBoxLayout, QLabel, QPlainTextEdit,
                                QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
+from ..core.shape import SHAPE_ITEMS, SHAPE_LABELS
 from ..core.text import ALIGN_CENTER, ALIGN_ITEMS, PARA_ITEMS
 from .adjust_panel import AdjustPanel
 from .tool_options import ColorSwatch
@@ -94,6 +95,71 @@ class Inspector(QWidget):
         # ---- 调整层参数（只有选中调整层时才显示）----
         self.adjust = AdjustPanel(main)
         root.addWidget(self.adjust)
+
+        # ---- 矢量形状（只有选中形状图层时才显示）----
+        self.g_shape = QGroupBox("形状")
+        fsh = QFormLayout(self.g_shape)
+        fsh.setLabelAlignment(Qt.AlignRight)
+
+        self.combo_shape = QComboBox()
+        self.combo_shape.addItems([lb for _k, lb in SHAPE_ITEMS])
+        self.combo_shape.setMaximumWidth(118)
+        self.combo_shape.setToolTip("改形状种类：矩形的圆角、多边形的边数"
+                                    "在下面")
+        self.combo_shape.currentIndexChanged.connect(self._on_shape_kind)
+        fsh.addRow("种类", self.combo_shape)
+
+        self.chk_fill = QCheckBox("填充")
+        self.chk_fill.toggled.connect(self._on_shape_fill)
+        self.sw_fill = ColorSwatch((217, 83, 79), "填充颜色")
+        self.sw_fill.clickedColor.connect(self._pick_shape_fill)
+        row_fill = QHBoxLayout()
+        row_fill.addWidget(self.chk_fill)
+        row_fill.addWidget(self.sw_fill)
+        fsh.addRow("填充", row_fill)
+
+        self.chk_stroke = QCheckBox("描边")
+        self.chk_stroke.toggled.connect(self._on_shape_stroke)
+        self.sw_stroke = ColorSwatch((38, 38, 38), "描边颜色")
+        self.sw_stroke.clickedColor.connect(self._pick_shape_stroke)
+        row_stk = QHBoxLayout()
+        row_stk.addWidget(self.chk_stroke)
+        row_stk.addWidget(self.sw_stroke)
+        fsh.addRow("描边", row_stk)
+
+        self.spin_stroke_w = self._dbl(0.0, 400.0, 1.0)
+        self.spin_stroke_w.valueChanged.connect(
+            lambda v: self._set_shape_style("stroke", "width", float(v)))
+        fsh.addRow("描边宽", self.spin_stroke_w)
+
+        self.spin_radius = self._dbl(0.0, 2000.0, 2.0)
+        self.spin_radius.setToolTip("矩形的圆角半径（像素）")
+        self.spin_radius.valueChanged.connect(
+            lambda v: self._set_shape_param("radius", float(v)))
+        fsh.addRow("圆角", self.spin_radius)
+
+        self.spin_sides = self._dbl(3, 60, 1)
+        self.spin_sides.setDecimals(0)
+        self.spin_sides.setToolTip("多边形的边数")
+        self.spin_sides.valueChanged.connect(
+            lambda v: self._set_shape_param("sides", int(round(v))))
+        fsh.addRow("边数", self.spin_sides)
+
+        self.spin_star = self._dbl(0, 90, 5)
+        self.spin_star.setDecimals(0)
+        self.spin_star.setToolTip("星形的内缩比：0 = 普通多边形，"
+                                  "越大角越尖（%）")
+        self.spin_star.valueChanged.connect(
+            lambda v: self._set_shape_param("star",
+                                            max(0.0, min(0.9, v / 100.0))))
+        fsh.addRow("星形", self.spin_star)
+
+        self.btn_raster_shape = QPushButton("栅格化")
+        self.btn_raster_shape.setToolTip(
+            "转成普通位图图层 —— 之后才能用画笔 / 滤镜改像素，但形状不能再改")
+        self.btn_raster_shape.clicked.connect(self.main.rasterize_shape)
+        fsh.addRow(self.btn_raster_shape)
+        root.addWidget(self.g_shape)
 
         # ---- 文字（只有选中文字图层时才显示）----
         self.g_text = QGroupBox("文字")
@@ -236,6 +302,10 @@ class Inspector(QWidget):
         self.g_text.setVisible(is_text)
         if is_text:
             self._fill_text(layer)
+        is_shape = bool(layer is not None and layer.is_shape)
+        self.g_shape.setVisible(is_shape)
+        if is_shape:
+            self._fill_shape(layer)
         self._fill_smart(layer)
         self._fill_style(layer)
         if is_adj:
@@ -261,11 +331,17 @@ class Inspector(QWidget):
             if layer.is_text:
                 extra = "\n字体: %s  %.0f px" % (
                     p.get("family") or "默认", float(p.get("size", 0.0)))
+            elif layer.is_shape:
+                sp = layer.shape or {}
+                extra = "\n形状: %s（矢量，缩放不失真）" % (
+                    SHAPE_LABELS.get(sp.get("kind"), sp.get("kind")),)
             self.info.setText(
                 "名称: %s\n类型: %s\n源尺寸: %d x %d\n缩放: %.1f%% x %.1f%%\n"
                 "蒙版: %s%s" % (layer.name,
                                 "文字" if layer.is_text
-                                else ("智能对象" if layer.is_smart else "位图"),
+                                else ("智能对象" if layer.is_smart
+                                      else ("形状" if layer.is_shape
+                                            else "位图")),
                                 src[0], src[1],
                                 layer.sx * 100, layer.sy * 100,
                                 "有" if layer.mask is not None else "无",
@@ -367,6 +443,80 @@ class Inspector(QWidget):
             return
         self.main.set_text_param(key, value)
 
+    # ---------- 矢量形状（第二十六批）----------
+
+    def _fill_shape(self, layer):
+        p = layer.shape or {}
+        keys = [k for k, _lb in SHAPE_ITEMS]
+        kind = p.get("kind", keys[0])
+        self.combo_shape.setCurrentIndex(
+            keys.index(kind) if kind in keys else 0)
+        fl = p.get("fill") or {}
+        st = p.get("stroke") or {}
+        self.chk_fill.setChecked(bool(fl.get("on", False)))
+        self.chk_stroke.setChecked(bool(st.get("on", False)))
+        c = fl.get("color") or (217, 83, 79)
+        self.sw_fill.set_color(
+            (int(c[0]), int(c[1]), int(c[2])) if len(c) >= 3 else (0, 0, 0))
+        c = st.get("color") or (38, 38, 38)
+        self.sw_stroke.set_color(
+            (int(c[0]), int(c[1]), int(c[2])) if len(c) >= 3 else (0, 0, 0))
+        self.spin_stroke_w.setValue(float(st.get("width", 4.0) or 0.0))
+        self.spin_radius.setValue(float(p.get("radius", 0.0) or 0.0))
+        self.spin_sides.setValue(float(p.get("sides", 6) or 6))
+        self.spin_star.setValue(
+            round(float(p.get("star", 0.0) or 0.0) * 100.0))
+        # 圆角只管矩形；边数 / 星形只管多边形（路径暂时不在面板里改）
+        is_rect = kind == "rect"
+        is_poly = kind == "polygon"
+        self.spin_radius.setEnabled(is_rect)
+        self.spin_sides.setEnabled(is_poly)
+        self.spin_star.setEnabled(is_poly)
+        self.chk_fill.setEnabled(kind != "line")
+
+    def _set_shape_param(self, key, value):
+        if self._syncing:
+            return
+        self.main.set_shape_param(key, value)
+
+    def _set_shape_style(self, which, key, value):
+        if self._syncing:
+            return
+        self.main.set_shape_style(which, key, value)
+
+    def _on_shape_kind(self, index):
+        if self._syncing:
+            return
+        if 0 <= index < len(SHAPE_ITEMS):
+            self.main.set_shape_param("kind", SHAPE_ITEMS[index][0])
+            self.refresh()
+
+    def _on_shape_fill(self, v):
+        if self._syncing:
+            return
+        self.main.set_shape_style("fill", "on", bool(v))
+
+    def _on_shape_stroke(self, v):
+        if self._syncing:
+            return
+        self.main.set_shape_style("stroke", "on", bool(v))
+
+    def _pick_shape_fill(self):
+        from PySide6.QtWidgets import QColorDialog
+        c = QColorDialog.getColor(self.sw_fill.color(), self, "填充颜色")
+        if c.isValid():
+            self.sw_fill.set_color((c.red(), c.green(), c.blue()))
+            self.main.set_shape_style(
+                "fill", "color", [c.red(), c.green(), c.blue()])
+
+    def _pick_shape_stroke(self):
+        from PySide6.QtWidgets import QColorDialog
+        c = QColorDialog.getColor(self.sw_stroke.color(), self, "描边颜色")
+        if c.isValid():
+            self.sw_stroke.set_color((c.red(), c.green(), c.blue()))
+            self.main.set_shape_style(
+                "stroke", "color", [c.red(), c.green(), c.blue()])
+
     def _set_para(self, key, value):
         """段落属性：一次写整份 dict（渲染那边按段落取值）。"""
         if self._syncing:
@@ -437,7 +587,7 @@ class Inspector(QWidget):
             return
         layer.flip_h = not layer.flip_h
         self.main.commit("水平翻转")
-        self.main.request_render()
+        self.main.request_render(self.main.layer_dirty_rect(layer))
 
     def _flip_v(self):
         layer = self.main.selected_layer()
@@ -445,7 +595,7 @@ class Inspector(QWidget):
             return
         layer.flip_v = not layer.flip_v
         self.main.commit("垂直翻转")
-        self.main.request_render()
+        self.main.request_render(self.main.layer_dirty_rect(layer))
 
     def _reset(self):
         layer = self.main.selected_layer()

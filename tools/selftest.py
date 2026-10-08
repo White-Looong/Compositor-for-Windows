@@ -3515,6 +3515,11 @@ def test_dirty_regions():
     assert win._want_full() is True
     print("  脏区占满画布：仍然退回整幅重算")
 
+    # 关窗口：第二十四批起，关窗口会把「改过没存」的标签逐个问一遍
+    # （见 main_window.closeEvent），离屏下弹 QMessageBox 会挂死 ——
+    # 这里先把会话标成已保存再关。
+    for s in getattr(win, "sessions", []):
+        s.mark_saved()
     win.close()
 
 

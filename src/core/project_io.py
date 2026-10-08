@@ -22,7 +22,7 @@ import zipfile
 import numpy as np
 from PIL import Image
 
-from .layer import LAYER_SMART
+from .layer import DERIVED_KINDS
 
 PROJECT_EXT = ".cwproj"
 
@@ -144,8 +144,9 @@ def save_project(doc, path):
 
     def walk(layers):
         for l in layers:
-            # 智能对象的栅格是派生出来的，绝不写进工程（体积大且必然过期）
-            if l.kind == LAYER_SMART:
+            # 智能对象 / 矢量形状的栅格是派生出来的，绝不写进工程
+            # （体积大且必然过期；读回来由 core.smart / core.shape 重算）
+            if l.kind in DERIVED_KINDS:
                 l.__dict__.pop("_img_key", None)
             elif l.image is not None:
                 key = "layers/%s.png" % l.id

@@ -32,6 +32,13 @@ PICK_TOOLS = {"picker"}
 CLONE_TOOLS = {"clone", "heal"}
 SHAPE_TOOLS = {"shape"}
 
+# 形状工具的下拉项：矢量图层模式多两种（多边形 / 星形），
+# 它们要"顶点参数"才能画，像素模式（往位图上涂）给不了
+SHAPE_VECTOR_ITEMS = ["矩形", "椭圆", "直线", "多边形", "星形"]
+SHAPE_PIXEL_ITEMS = ["矩形", "椭圆", "直线"]
+_SHAPE_KEYS = {"矩形": "rect", "椭圆": "ellipse", "直线": "line",
+               "多边形": "polygon", "星形": "polygon"}
+
 
 def _slider(maximum, value, width=92):
     s = QSlider(Qt.Horizontal)
@@ -105,9 +112,13 @@ class ToolOptions(QToolBar):
 
         # 克隆图章：Alt 采样的偏移（源坐标 - 当前落点），按住 Alt 重新采样
         self.clone_offset = None
-        # 形状工具：矩形 / 椭圆 / 直线，填充用前景色
+        # 形状工具：绘制模式 + 形状，填充用前景色、描边用背景色
+        # mode = "shape" 建**矢量形状图层**；"pixel" 直接画在当前图层的像素上
+        self.shape_mode = "shape"
         self.shape_kind = "矩形"
         self.shape_outline = False
+        self.shape_fill = True
+        self.shape_stroke_w = 4.0
 
         self._build_hint()
         self._build_select()
@@ -426,30 +437,58 @@ class ToolOptions(QToolBar):
         label.setText("%d%%" % v)
 
     def _build_shape(self):
-        """形状工具：矩形 / 椭圆 / 直线 + 实心 / 描边。"""
+        """形状工具：绘制模式（矢量图层 / 像素）+ 形状 + 填充 · 描边。"""
         self.grp_shape = QWidget()
         lay = QHBoxLayout(self.grp_shape)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
 
+        self.combo_shape_mode = QComboBox()
+        self.combo_shape_mode.addItems(["矢量图层", "像素"])
+        self.combo_shape_mode.setMaximumWidth(90)
+        self.combo_shape_mode.setToolTip(
+            "矢量图层 —— 建一个可编辑的形状图层：放大缩小不糊，"
+            "颜色 / 圆角 / 边数随时改\n"
+            "像素 —— 直接画在当前图层的像素上（画完不能再改）")
+        self.combo_shape_mode.currentTextChanged.connect(self._on_shape_mode)
+        lay.addWidget(QLabel("绘制为"))
+        lay.addWidget(self.combo_shape_mode)
+
         self.combo_shape = QComboBox()
-        self.combo_shape.addItems(["矩形", "椭圆", "直线"])
         self.combo_shape.setMaximumWidth(80)
         self.combo_shape.currentTextChanged.connect(
             lambda s: setattr(self, "shape_kind", s))
-        lay.addWidget(QLabel("形状"))
         lay.addWidget(self.combo_shape)
 
         cb = QCheckBox("描边")
-        cb.setToolTip("不勾 = 实心填充；勾了 = 只画边框，内部不动")
+        cb.setToolTip("矢量图层：画一圈边框（用背景色）；像素：只画边框，内部不动")
         cb.toggled.connect(lambda v: setattr(self, "shape_outline", bool(v)))
         self.chk_shape_outline = cb
         lay.addWidget(cb)
+
+        cbf = QCheckBox("填充")
+        cbf.setChecked(True)
+        cbf.setToolTip("矢量图层：形状内部填前景色")
+        cbf.toggled.connect(lambda v: setattr(self, "shape_fill", bool(v)))
+        self.chk_shape_fill = cbf
+        lay.addWidget(cbf)
+
+        self.spin_shape_stroke = QSpinBox()
+        self.spin_shape_stroke.setRange(1, 400)
+        self.spin_shape_stroke.setValue(int(self.shape_stroke_w))
+        self.spin_shape_stroke.setMaximumWidth(58)
+        self.spin_shape_stroke.setToolTip("矢量图层的描边宽度（像素）")
+        self.spin_shape_stroke.valueChanged.connect(
+            lambda v: setattr(self, "shape_stroke_w", float(v)))
+        lay.addWidget(QLabel("描边宽"))
+        lay.addWidget(self.spin_shape_stroke)
 
         self.lab_shape_hint = QLabel("拖出形状，Shift 等比")
         self.lab_shape_hint.setStyleSheet("color:#9a9a9e;")
         lay.addWidget(self.lab_shape_hint)
         self.act_shape = self.addWidget(self.grp_shape)
+
+        self._on_shape_mode(self.combo_shape_mode.currentText())
 
     def _build_colors(self):
         self.fg = ColorSwatch((0, 0, 0), "前景色")
@@ -521,7 +560,55 @@ class ToolOptions(QToolBar):
                 "strength": float(self.blur_strength)}
 
     def shape_params(self):
-        return {"kind": self.shape_kind, "outline": bool(self.shape_outline)}
+        p = {"kind": self.shape_kind, "outline": bool(self.shape_outline)}
+        return p
+
+    # ---------- 矢量形状图层（第二十六批）----------
+
+    def _on_shape_mode(self, text):
+        """切换「矢量图层 / 像素」：可选形状不同，给矢量模式补上专属控件。"""
+        self.shape_mode = "pixel" if text == "像素" else "shape"
+        vec = self.shape_mode == "shape"
+        items = SHAPE_VECTOR_ITEMS if vec else SHAPE_PIXEL_ITEMS
+        cur = self.shape_kind if self.shape_kind in items else items[0]
+        self.combo_shape.blockSignals(True)
+        self.combo_shape.clear()
+        self.combo_shape.addItems(items)
+        self.combo_shape.setCurrentText(cur)
+        self.combo_shape.blockSignals(False)
+        self.shape_kind = cur
+        self.chk_shape_fill.setEnabled(vec)
+        self.spin_shape_stroke.setEnabled(vec)
+        self.lab_shape_hint.setText(
+            "拖出形状，Shift 等比 · 填充=前景色，描边=背景色"
+            if vec else "拖出形状，Shift 等比")
+
+    def shape_layer_params(self, box):
+        """矢量形状图层的参数：形状 + 填充（前景色）+ 描边（背景色）。
+
+        `box` 是画布坐标的 (x0, y0, x1, y1)。注意形状参数里的几何量是
+        **局部坐标**，渲染时会先平移到原点再画（见 core.shape）。
+        """
+        lab = self.shape_kind
+        kind = _SHAPE_KEYS.get(lab, "rect")
+        p = {
+            "kind": kind,
+            "box": [float(box[0]), float(box[1]),
+                    float(box[2]), float(box[3])],
+            "fill": {"on": bool(self.shape_fill),
+                     "color": list(self.fg.rgb()), "opacity": 1.0},
+            "stroke": {"on": bool(self.shape_outline),
+                       "color": list(self.bg.rgb()),
+                       "width": float(self.shape_stroke_w),
+                       "opacity": 1.0},
+        }
+        if lab == "星形":
+            p["star"] = 0.45
+        if kind == "line":
+            # 直线没有"内部"，描边就是它本身 —— 强制开描边、关填充
+            p["stroke"]["on"] = True
+            p["fill"]["on"] = False
+        return p
 
     # ---------- 笔刷 ----------
 
